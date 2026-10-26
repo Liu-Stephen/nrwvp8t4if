@@ -205,7 +205,7 @@ function maskEmails(value) {
 // 生日留空时随机取 22~32 岁；日只到 28，避免造出非法日期。
 function resolveBirthday() {
     const raw = CONFIG.birthday;
-    const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+    const matched = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(raw);
     if (matched) {
         const year = Number(matched[1]);
         const month = Number(matched[2]);
@@ -523,49 +523,8 @@ function tagOtpFields() {
     return info;
 }
 
-// 在页面上下文中执行：关掉「Something went wrong」这类模态框（没有则返回 null）。
-function dismissErrorDialog() {
-    const isVisible = (el) => {
-        try {
-            const style = window.getComputedStyle(el);
-            if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
-                return false;
-            }
-            const rect = el.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0;
-        } catch (_) {
-            return false;
-        }
-    };
-    const clean = (value, max = 300) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
-
-    const isCloseish = (el) => {
-        if (String(el.getAttribute('aria-label') || '').toLowerCase() === 'close') return true;
-        return clean(el.innerText || el.value || el.textContent, 20).toLowerCase() === 'ok';
-    };
-    // 「Returning to login」这类按钮的 aria-label 也是 close，点下去等于 POST /api/auth/native/restart，
-    // 当前这一屏（生日下拉）会被整个换掉，所以只能认出来、不能点。
-    const isNavigational = (el) => /return(ing| back)|back to|log ?in|sign ?in/i.test(clean(el.innerText || el.textContent, 40));
-
-    const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter((el) => isVisible(el) && isCloseish(el));
-    if (!buttons.length) return null;
-
-    const target = buttons.find((el) => !isNavigational(el)) || buttons[0];
-    const navigational = isNavigational(target);
-    target.setAttribute('data-muse-dismiss', navigational ? 'nav' : '1');
-    const dialog = target.closest('[role="dialog"], [role="alertdialog"]') || target.parentElement;
-    return {
-        label: clean(target.getAttribute('aria-label') || target.innerText || target.textContent, 30),
-        text: dialog ? clean(dialog.innerText || dialog.textContent) : '',
-        button: clean(target.innerText || target.textContent, 40),
-        navigational
-    };
-}
-
-// 在页面上下文中执行：标记生日屏的三个隐藏 select（可见的是自定义按钮，别点）和提交按钮。
-function tagBirthdayFields() {
-    const clean = (value, max = 120) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
-
+// 在页面上下文中执行：读生日屏的三个隐藏 select（可见的是自定义按钮，别点）的当前值和选项数。
+function readBirthdayFields() {
     const pick = (name) => Array.from(document.querySelectorAll('select'))
         .find((el) => String(el.autocomplete || '').toLowerCase() === name) || null;
 
@@ -574,30 +533,12 @@ function tagBirthdayFields() {
     const year = pick('bday-year');
     if (!month || !day || !year) return null;
 
-    month.setAttribute('data-muse-bday', 'month');
-    day.setAttribute('data-muse-bday', 'day');
-    year.setAttribute('data-muse-bday', 'year');
-
-    const info = {
+    return {
         monthOptions: month.options ? month.options.length : 0,
         dayOptions: day.options ? day.options.length : 0,
         yearOptions: year.options ? year.options.length : 0,
-        current: `${month.value}/${day.value}/${year.value}`,
-        submit: null
+        current: `${month.value}/${day.value}/${year.value}`
     };
-
-    const scope = month.closest('form') || document;
-    const submit = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"]'))
-        .find((el) => !el.disabled) || null;
-    if (submit) {
-        submit.setAttribute('data-muse-bday', 'submit');
-        info.submit = {
-            tag: String(submit.tagName || '').toLowerCase(),
-            type: submit.getAttribute('type') || '',
-            text: clean(submit.innerText || submit.value || submit.textContent, 60)
-        };
-    }
-    return info;
 }
 
 async function collectPageSummary(page) {
@@ -1001,40 +942,38 @@ async function fillOtpAndSubmit(page, code) {
     return false;
 }
 
-async function dismissDialog(page) {
-    for (let round = 0; round < 3; round += 1) {
-        let hit = null;
-        for (const frame of page.frames()) {
-            try {
-                const found = await frame.evaluate(dismissErrorDialog);
-                if (found) {
-                    hit = { frame, found };
-                    break;
-                }
-            } catch (_) {
-                // 跨域或已销毁的 frame，跳过。
-            }
+// app 在生日屏一 mount 就拿默认值（今天，0 岁）发一发 register-completion，实测比任何 UI 动作都早
+// （140708：confirm-otp 200 后 2.36 s 发出 {"date_of_birth":"2026-10-26"}，我们 18 s 后才开始碰下拉）。
+// 所以成年生日只能改写它自己那一发的请求体；date_of_birth 是唯一带生日的字段，其余字段原样保留。
+async function holdAdultBirthday(page, birthday) {
+    const iso = `${birthday.year}-${String(birthday.month).padStart(2, '0')}-${String(birthday.day).padStart(2, '0')}`;
+    await page.route('**/api/auth/native/register-completion', async (route) => {
+        const raw = route.request().postData() || '';
+        // 只就地换 date_of_birth 的那 10 个字符：整包 parse/stringify 会改字节长度，
+        // 而浏览器带上去的 Content-Length 不一定跟着改，服务端会读到截断或多余的 JSON。
+        const next = raw.replace(/("date_of_birth":")[^"]{10}(")/, `$1${iso}$2`);
+        if (next === raw) {
+            console.log('[Muse] register-completion 请求体里没有 date_of_birth，原样放行。');
+            await route.continue().catch(() => {});
+            return;
         }
-        if (!hit) return false;
-        if (hit.found.navigational) {
-            console.log(`[Muse] 弹框只剩跳转按钮「${hit.found.button}」，点了会重启注册流程，留着不动`);
-            return true;
-        }
-        console.log(`[Muse] 关掉弹框 [${hit.found.label}] ${truncate(hit.found.text, 200)}`);
-        await humanPause(page, 400, 1300);
-        await humanClick(page, hit.frame.locator('[data-muse-dismiss="1"]').first());
-        await humanPause(page, 500, 1200);
-    }
-    return true;
+        console.log(`[Muse] 改写 register-completion 生日 -> ${iso}（${birthday.source}）`);
+        // network.jsonl 里的 postData 可能是改写前的，这里以出网体为准。
+        console.log(`[Muse] 出网体 ${truncate(maskEmails(next), 500)}`);
+        await route.continue({ postData: next }).catch(() => {});
+    });
+    console.log(`[Muse] 已挂上 register-completion 生日改写，目标日期=${iso}`);
 }
 
-async function fillBirthdayAndSubmit(page, birthday) {
+// 把生日选进三个隐藏下拉。提交内容不由这里决定（成年生日靠 holdAdultBirthday 改写请求体带上去），
+// 这里只让画面和 app 自己的 state 对齐，选不上也只影响观感、不影响判读。
+async function fillBirthdayFields(page, birthday) {
     const pageFrames = page.frames();
     for (let i = 0; i < pageFrames.length; i += 1) {
         const frame = pageFrames[i];
         let info = null;
         try {
-            info = await frame.evaluate(tagBirthdayFields);
+            info = await frame.evaluate(readBirthdayFields);
         } catch (_) {
             continue;
         }
@@ -1048,7 +987,9 @@ async function fillBirthdayAndSubmit(page, birthday) {
         ];
         for (const [key, value] of picks) {
             try {
-                const select = frame.locator(`[data-muse-bday="${key}"]`).first();
+                // 按原生 autocomplete 定位：它不会随 React 重渲染消失。
+                // 之前用注入的 data-muse-bday 找元素，选完 month 节点被换掉，day 白等了 30 秒（140708）。
+                const select = frame.locator(`select[autocomplete="bday-${key}"]`).first();
                 await select.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
                 // 只改 DOM 的 value，React 的 value tracker 会认为值没变、onChange 不跑，
                 // 提交时拿到的还是 state 里的默认值。用原生 setter 绕过它自己的描述符再派发事件。
@@ -1058,14 +999,14 @@ async function fillBirthdayAndSubmit(page, birthday) {
                     el.dispatchEvent(new Event('input', { bubbles: true }));
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                     return String(el.value || '');
-                }, value);
+                }, value, { timeout: 5000 });
                 if (changed !== value) {
                     throw new Error(`回读=${changed || '<空>'}`);
                 }
                 await humanPause(page, 260, 900);
             } catch (error) {
                 console.error(`[Muse] 选择 ${key}=${value} 失败: ${error.message}`);
-                return false;
+                return;
             }
         }
         const after = await frame.evaluate(() => {
@@ -1093,34 +1034,8 @@ async function fillBirthdayAndSubmit(page, birthday) {
         }).catch(() => '');
         console.log(`[Muse] 生日已选 ${birthday.year}-${birthday.month}-${birthday.day}（${birthday.source}）选中后=${after || '<未知>'}`);
         markProgress(96);
-
-        const submit = frame.locator('[data-muse-bday="submit"]').first();
-        try {
-            if (!(await submit.count())) {
-                console.log('[Muse] 生日屏没有提交按钮，保留现场不回车。');
-                return true;
-            }
-            await humanPause(page, 700, 2000);
-            if (await humanClick(page, submit)) {
-                return true;
-            }
-            // 点到这一步失败基本都是 403 弹框（fixed w-full）盖住了按钮，关掉非导航的那层再点一次。
-            console.log('[Muse] 生日提交第一次没点到，先看是不是被弹框盖住');
-            if (await dismissDialog(page)) {
-                await humanPause(page, 400, 1200);
-                if (await humanClick(page, submit)) {
-                    return true;
-                }
-            }
-            // 这里绝不能用回车兜底：实测回车发出的是 restart 201，整屏会被换回首页。
-            console.log('[Muse] 生日提交按钮仍然点不到，保留现场，不回车。');
-            return true;
-        } catch (error) {
-            console.error(`[Muse] 生日提交失败: ${error.message}`);
-            return false;
-        }
+        return;
     }
-    return false;
 }
 
 async function dumpExtraPages(context, page, prefix) {
@@ -1153,11 +1068,12 @@ function attachNetworkLog(context) {
         }
     };
 
-    // 生日到底以什么字段发出去我们从来没见过，请求体先存一份（邮箱打码）。
+    // 生日到底以什么字段发出去全靠这一行，请求体先存一份（邮箱打码）。
+    // 只存 register-completion：confirm-otp 的体里是登录验证码，写进日志和导出产物没有意义。
     context.on('request', (request) => {
         try {
             const rawUrl = request.url();
-            if (!/\/api\/auth\/native\/(register-completion|confirm-otp)/i.test(rawUrl)) return;
+            if (!/\/api\/auth\/native\/register-completion/i.test(rawUrl)) return;
             const body = request.postData();
             if (!body) return;
             write({
@@ -1196,6 +1112,18 @@ function attachNetworkLog(context) {
                         status: response.status(),
                         url: sanitizeUrl(rawUrl),
                         body: truncate(body, 2000)
+                    });
+                }).catch(() => {});
+            }
+            // 成功那一发里可能带凭据，只记顶层字段名：够判断注册到底走没走过去，又不泄露 token。
+            if (/\/api\/auth\/native\/register-completion/i.test(rawUrl) && response.status() < 400) {
+                response.json().then((parsed) => {
+                    write({
+                        at: new Date().toISOString(),
+                        kind: 'completion-keys',
+                        status: response.status(),
+                        url: sanitizeUrl(rawUrl),
+                        keys: Object.keys(parsed || {})
                     });
                 }).catch(() => {});
             }
@@ -1405,29 +1333,23 @@ async function run() {
                             console.log(`[Muse] 第二屏 ${formatOtpTarget(otpField.info)}`);
                             markProgress(86);
                             const code = await waitForInputCode(CONFIG.otpTimeoutMs);
-                            if (code && await fillOtpAndSubmit(page, code)) {
-                                await settleAfterAction(page);
-                                await dumpPage(page, '06-after-otp');
-                                markProgress(94);
-                                await dumpExtraPages(context, page, '06-after-otp-page');
-
-                                // 这一屏一渲染就拿着默认值（今天，0 岁）自己提交了一次 register-completion，
-                                // 而弹框一点（尤其「Returning to login」）整个流程就 restart、下拉框全消失，
-                                // 所以必须趁表单还活着先把生日选掉，弹框放到之后再处理。
+                            if (code) {
                                 const birthday = resolveBirthday();
-                                let birthdayDone = await fillBirthdayAndSubmit(page, birthday);
-                                if (!birthdayDone) {
-                                    console.log('[Muse] 这一屏没有 bday-* 生日下拉，先关弹框再找一次。');
-                                    await dismissDialog(page);
-                                    birthdayDone = await fillBirthdayAndSubmit(page, birthday);
-                                }
-                                if (birthdayDone) {
+                                // 生日屏一 mount 就会用 0 岁默认值提交，所以改写必须在提交验证码之前挂好。
+                                await holdAdultBirthday(page, birthday);
+                                if (await fillOtpAndSubmit(page, code)) {
+                                    await settleAfterAction(page);
+                                    await dumpPage(page, '06-after-otp');
+                                    markProgress(94);
+                                    await dumpExtraPages(context, page, '06-after-otp-page');
+
+                                    // 生日是否真带上去了只看那条「改写 register-completion」日志和它的响应码，
+                                    // 下拉选没选上只影响画面，所以这里不拦 dump。
+                                    await fillBirthdayFields(page, birthday);
                                     await settleAfterAction(page);
                                     await dumpPage(page, '07-after-birthday');
                                     markProgress(98);
                                     await dumpExtraPages(context, page, '07-after-birthday-page');
-                                } else {
-                                    console.log('[Muse] 关掉弹框后还是没有生日下拉，侦察到此为止。');
                                 }
                             }
                         }
