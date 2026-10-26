@@ -49,7 +49,8 @@ const CONFIG = {
     cdpPort: String(process.env.MUSE_CDP_PORT || '9333').trim(),
     navigationTimeoutMs: Number(process.env.MUSE_NAV_TIMEOUT_MS || 90000),
     settleMs: Number(process.env.MUSE_SETTLE_MS || 3000),
-    otpTimeoutMs: Number(process.env.MUSE_OTP_TIMEOUT_MS || 300000)
+    otpTimeoutMs: Number(process.env.MUSE_OTP_TIMEOUT_MS || 300000),
+    humanize: String(process.env.MUSE_HUMANIZE || '1') !== '0'
 };
 
 const RUN_DIR = path.join(CONFIG.debugRoot, stamp());
@@ -57,6 +58,110 @@ const VIDEO_TAG = String(process.env.MUSE_JOB_KEY || '').replace(/[^a-zA-Z0-9_-]
 
 function markProgress(value) {
     console.log(`MUSE_PROGRESS: ${value}`);
+}
+
+function randInt(min, max) {
+    const low = Math.max(0, Math.round(min));
+    const high = Math.max(low, Math.round(max));
+    return low + Math.floor(Math.random() * (high - low + 1));
+}
+
+async function humanPause(page, min, max) {
+    const ms = CONFIG.humanize ? randInt(min, max) : Math.max(0, min);
+    await page.waitForTimeout(ms).catch(() => {});
+}
+
+// 鼠标不是瞬移的：从上一个落点滑行到目标，中途带一点抖动，终点停在元素中心附近而不是正中。
+// 支付链路已有一份同类实现（human-verification.js 的 humanMouseMove），但它所在模块 require 了验证码求解依赖，
+// 侦察脚本要保持独立，所以这里各留一份，改节奏时记得两边都看。
+let cursor = null;
+
+async function glideMouse(page, x, y) {
+    if (!CONFIG.humanize) {
+        await page.mouse.move(x, y).catch(() => {});
+        cursor = { x, y };
+        return;
+    }
+    const from = cursor || { x: randInt(200, 1200), y: randInt(200, 700) };
+    // 真人指针是按屏幕帧率出点的：大约每 20px 报一个位置、每个位置一帧（12~20ms）。
+    // 所以步数和总时长都跟着距离走：900px 一趟约 45 步、600~900ms，短距离移动才不会拖泥带水。
+    const steps = Math.min(50, Math.max(8, Math.round(Math.hypot(x - from.x, y - from.y) / 20)));
+    for (let i = 1; i <= steps; i += 1) {
+        const t = i / steps;
+        const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+        const jitter = i === steps ? 0 : randInt(-3, 3);
+        // 页面可能在这一下之前就关了（验证码提交后换屏），滑行失败不该把后面的截图整段带走。
+        await page.mouse.move(from.x + (x - from.x) * ease + jitter, from.y + (y - from.y) * ease + jitter).catch(() => {});
+        await humanPause(page, 12, 20);
+    }
+    cursor = { x, y };
+}
+
+async function humanClick(page, locator) {
+    await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    const box = await locator.boundingBox().catch(() => null);
+    if (box && box.width >= 6 && box.height >= 6) {
+        const x = randInt(Math.round(box.width * 0.3), Math.round(box.width * 0.7));
+        const y = randInt(Math.round(box.height * 0.3), Math.round(box.height * 0.7));
+        await glideMouse(page, box.x + x, box.y + y);
+        await humanPause(page, 70, 220);
+        try {
+            await locator.click({ timeout: 15000, position: { x, y } });
+            return true;
+        } catch (error) {
+            // 按下之后页面也可能已经跳转并报这个错，再补一次点击就是二次提交，交给调用方兜底。
+            console.log(`[Muse] 偏移点击没成功，交给调用方兜底: ${error.message}`);
+            return false;
+        }
+    }
+    try {
+        await locator.click({ timeout: 10000 });
+        return true;
+    } catch (error) {
+        // sr-only 之类的输入框点不到，聚焦后照样能敲键盘。
+        console.log(`[Muse] 点击失败，改用 focus: ${error.message}`);
+        await locator.focus({ timeout: 5000 }).catch(() => {});
+        return false;
+    }
+}
+
+// 逐字符敲键，敲完回读；没落上就退回 fill，避免为了节奏把表单填空。
+async function typeInto(page, locator, text, minDelay = 60, maxDelay = 180) {
+    if (!CONFIG.humanize) {
+        await locator.fill(String(text), { timeout: 10000 }).catch((error) => {
+            console.error(`[Muse] fill 失败: ${error.message}`);
+        });
+        return;
+    }
+    await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+    await humanClick(page, locator);
+    await humanPause(page, 140, 460);
+    const chars = Array.from(String(text));
+    for (let i = 0; i < chars.length; i += 1) {
+        await page.keyboard.type(chars[i]);
+        await page.waitForTimeout(randInt(minDelay, maxDelay));
+        if (chars[i] === '@' || chars[i] === '.') {
+            await humanPause(page, 200, 520);
+        }
+    }
+    const typed = await locator.evaluate((el) => String(el.value || '')).catch(() => '');
+    if (typed.length !== chars.length) {
+        console.log(`[Muse] 逐字符输入后只剩 ${typed.length}/${chars.length} 位，改用 fill`);
+        await locator.fill(String(text), { timeout: 10000 }).catch((error) => {
+            console.error(`[Muse] fill 兜底失败: ${error.message}`);
+        });
+    }
+}
+
+// 首屏先像访客一样滚两下，别一进来就直奔输入框。
+async function idleBrowse(page) {
+    if (!CONFIG.humanize) return;
+    for (let i = 0; i < randInt(2, 3); i += 1) {
+        await page.mouse.wheel(0, randInt(180, 420)).catch(() => {});
+        await humanPause(page, 400, 1200);
+    }
+    await page.mouse.wheel(0, -randInt(300, 700)).catch(() => {});
+    await humanPause(page, 300, 900);
 }
 
 function sanitizeUrl(raw) {
@@ -684,11 +789,10 @@ async function hasAuthInput(page) {
     return false;
 }
 
-async function clickCandidate(candidate) {
+async function clickCandidate(page, candidate) {
     const selector = `[data-muse-debug-id="${candidate.debugId}"]`;
     const locator = candidate.frame.locator(selector).first();
-    await locator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-    await locator.click({ timeout: 15000 });
+    await humanClick(page, locator);
 }
 
 async function awaitAuthInput(page, timeoutMs = 10000) {
@@ -696,7 +800,7 @@ async function awaitAuthInput(page, timeoutMs = 10000) {
     for (;;) {
         if (await hasAuthInput(page)) return true;
         if (Date.now() >= deadline) return false;
-        await page.waitForTimeout(1000);
+        await humanPause(page, 600, 1300);
     }
 }
 
@@ -726,10 +830,9 @@ async function fillAuthInputAndSubmit(page, account) {
 
         const input = frame.locator('[data-muse-auth="input"]').first();
         console.log(`[Muse] 填写邮箱/手机号 frame#${i} ${formatAuthTarget(info)} <- ${maskAccount(account)}`);
-        await input.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+        await humanPause(page, 500, 1400);
         try {
-            await input.click({ timeout: 10000 });
-            await input.fill(account, { timeout: 10000 });
+            await typeInto(page, input, account);
         } catch (error) {
             console.error(`[Muse] 输入框填写失败: ${error.message}`);
             return false;
@@ -739,8 +842,12 @@ async function fillAuthInputAndSubmit(page, account) {
         const submit = frame.locator('[data-muse-auth="submit"]').first();
         try {
             if (await submit.count()) {
-                await submit.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-                await submit.click({ timeout: 15000 });
+                // 敲完不会马上按提交，留一段「看一眼再点」的间隔。
+                await humanPause(page, 600, 1800);
+                if (!await humanClick(page, submit)) {
+                    console.log('[Muse] 提交按钮没点到，改用回车提交');
+                    await input.press('Enter').catch(() => {});
+                }
             } else {
                 await input.press('Enter');
             }
@@ -840,26 +947,32 @@ async function fillOtpAndSubmit(page, code) {
 
         const input = frame.locator('[data-muse-otp="input"]').first();
         console.log(`[Muse] 填写验证码 frame#${i} ${formatOtpTarget(info)}`);
-        await input.fill(code, { timeout: 10000 }).catch((error) => {
-            console.error(`[Muse] 验证码 fill 失败: ${error.message}`);
+        // 真人拿到码也是先看一眼再敲，不会瞬间灌进去。
+        await humanPause(page, 700, 1800);
+        await typeInto(page, input, code, 90, 260).catch((error) => {
+            console.error(`[Muse] 验证码输入失败: ${error.message}`);
         });
 
         const value = await input.evaluate((el) => String(el.value || '')).catch(() => '');
         if (value.length !== code.length) {
-            // 装饰格子由 React state 驱动，fill 没生效时退回逐字符敲键。
-            console.log(`[Muse] fill 后读到 ${value.length} 位，改用逐字符输入`);
+            // 装饰格子由 React state 驱动，前两种写法都没落上时清空再敲一遍。
+            console.log(`[Muse] 验证码只落上 ${value.length} 位，清空重敲`);
             await input.evaluate((el) => {
                 el.value = '';
                 el.focus();
             }).catch(() => {});
-            await page.keyboard.type(code, { delay: 80 }).catch(() => {});
+            await page.keyboard.type(code, { delay: 110 }).catch(() => {});
         }
         markProgress(90);
 
         const submit = frame.locator('[data-muse-otp="submit"]').first();
         try {
             if (await submit.count()) {
-                await submit.click({ timeout: 15000 });
+                await humanPause(page, 500, 1500);
+                if (!await humanClick(page, submit)) {
+                    console.log('[Muse] 确认按钮没点到，改用回车提交');
+                    await input.press('Enter').catch(() => {});
+                }
             } else {
                 await input.press('Enter');
             }
@@ -888,10 +1001,9 @@ async function dismissDialog(page) {
         }
         if (!hit) return false;
         console.log(`[Muse] 关掉弹框 [${hit.found.label}] ${truncate(hit.found.text, 200)}`);
-        await hit.frame.locator('[data-muse-dismiss="1"]').first().click({ timeout: 10000 }).catch((error) => {
-            console.error(`[Muse] 弹框关闭失败: ${error.message}`);
-        });
-        await page.waitForTimeout(500);
+        await humanPause(page, 400, 1300);
+        await humanClick(page, hit.frame.locator('[data-muse-dismiss="1"]').first());
+        await humanPause(page, 500, 1200);
     }
     return true;
 }
@@ -916,7 +1028,10 @@ async function fillBirthdayAndSubmit(page, birthday) {
         ];
         for (const [key, value] of picks) {
             try {
-                await frame.locator(`[data-muse-bday="${key}"]`).first().selectOption(value, { timeout: 10000 });
+                const select = frame.locator(`[data-muse-bday="${key}"]`).first();
+                await select.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+                await select.selectOption(value, { timeout: 10000 });
+                await humanPause(page, 260, 900);
             } catch (error) {
                 console.error(`[Muse] 选择 ${key}=${value} 失败: ${error.message}`);
                 return false;
@@ -936,11 +1051,16 @@ async function fillBirthdayAndSubmit(page, birthday) {
         const submit = frame.locator('[data-muse-bday="submit"]').first();
         try {
             if (await submit.count()) {
-                await submit.click({ timeout: 15000 });
-            } else {
-                console.log('[Muse] 没找到可用的提交按钮，改用回车');
-                await frame.locator('[data-muse-bday="year"]').first().press('Enter');
+                await humanPause(page, 700, 2000);
+                if (await humanClick(page, submit)) {
+                    return true;
+                }
+                console.log('[Muse] 生日提交按钮没点到，改用回车');
+                await frame.locator('[data-muse-bday="year"]').first().press('Enter').catch(() => {});
+                return true;
             }
+            console.log('[Muse] 没找到可用的提交按钮，改用回车');
+            await frame.locator('[data-muse-bday="year"]').first().press('Enter');
         } catch (error) {
             console.error(`[Muse] 生日提交失败: ${error.message}`);
             return false;
@@ -958,7 +1078,7 @@ async function dumpExtraPages(context, page, prefix) {
 }
 
 async function settleAfterAction(page) {
-    await page.waitForTimeout(CONFIG.settleMs);
+    await humanPause(page, CONFIG.settleMs - 400, CONFIG.settleMs + 900);
     await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
     await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 }
@@ -1106,7 +1226,7 @@ async function run() {
 
     console.log(`[Muse] 侦察开始 url=${CONFIG.url}`);
     console.log(`[Muse] 日志目录 ${RUN_DIR}`);
-    console.log(`[Muse] headful=${CONFIG.headful} proxy=${CONFIG.proxy ? 'yes' : 'no'} clickSignup=${CONFIG.clickSignup} account=${CONFIG.account ? maskAccount(CONFIG.account) : '<none>'}`);
+    console.log(`[Muse] headful=${CONFIG.headful} proxy=${CONFIG.proxy ? 'yes' : 'no'} clickSignup=${CONFIG.clickSignup} humanize=${CONFIG.humanize ? 'on' : 'off'} account=${CONFIG.account ? maskAccount(CONFIG.account) : '<none>'}`);
 
     const preparedProxy = await preparePlaywrightProxy(CONFIG.proxy);
     let session = null;
@@ -1142,7 +1262,8 @@ async function run() {
 
         await page.goto(CONFIG.url, { waitUntil: 'domcontentloaded', timeout: CONFIG.navigationTimeoutMs });
         await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
-        await page.waitForTimeout(1500);
+        await humanPause(page, 900, 2200);
+        await idleBrowse(page);
         await dumpPage(page, '01-home');
         markProgress(40);
 
@@ -1167,20 +1288,20 @@ async function run() {
                     const popupPromise = page.waitForEvent('popup', { timeout: 5000 }).catch(() => null);
                     markProgress(55);
                     try {
-                        await clickCandidate(target);
+                        await clickCandidate(page, target);
                     } catch (error) {
                         console.error(`[Muse] 点击失败: ${error.message}`);
                     }
 
                     const popup = await popupPromise;
-                    await page.waitForTimeout(CONFIG.settleMs);
+                    await humanPause(page, CONFIG.settleMs - 400, CONFIG.settleMs + 900);
                     await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
                     await dumpPage(page, '02-after-signup-click');
                     markProgress(80);
 
                     if (popup) {
                         await popup.waitForLoadState('domcontentloaded', { timeout: CONFIG.navigationTimeoutMs }).catch(() => {});
-                        await popup.waitForTimeout(1500);
+                        await humanPause(popup, 1000, 2400);
                         await dumpPage(popup, '03-popup');
                         markProgress(88);
                     }

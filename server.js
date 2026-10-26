@@ -2733,6 +2733,7 @@ app.post('/api/admin/muse/start', async (req, res) => {
         const clickSignup = body.click_signup !== false;
         const networkLog = body.network_log !== false;
         const video = body.video !== false;
+        const humanize = body.humanize !== false;
         const proxy = String(body.proxy || '').trim();
         const account = String(body.account || '').replace(/\s/g, '').slice(0, 320);
         const birthday = String(body.birthday || '').trim().slice(0, 32);
@@ -2754,8 +2755,8 @@ app.post('/api/admin/muse/start', async (req, res) => {
             message: 'Muse 侦察启动中...',
             progress: 1
         });
-        logTask(task.jobKey, `Muse 注册调试任务已创建 url=${url} proxy=${proxy ? 'yes' : 'no'} video=${video ? 'yes' : 'no'} account=${account ? 'yes' : 'no'} birthday=${birthday || '<random>'}`);
-        spawnMuseDebugWorker({ task, url, account, birthday, clickSignup, networkLog, video, proxy });
+        logTask(task.jobKey, `Muse 注册调试任务已创建 url=${url} proxy=${proxy ? 'yes' : 'no'} video=${video ? 'yes' : 'no'} humanize=${humanize ? 'on' : 'off'} account=${account ? 'yes' : 'no'} birthday=${birthday || '<random>'}`);
+        spawnMuseDebugWorker({ task, url, account, birthday, clickSignup, networkLog, video, humanize, proxy });
 
         return res.json({ success: true, jobKey: task.jobKey });
     } catch (error) {
@@ -2817,7 +2818,7 @@ app.post('/api/admin/muse/input/:jobKey', async (req, res) => {
     }
 });
 
-function spawnMuseDebugWorker({ task, url, account, birthday, clickSignup, networkLog, video, proxy }) {
+function spawnMuseDebugWorker({ task, url, account, birthday, clickSignup, networkLog, video, humanize, proxy }) {
     (async () => {
         const scriptPath = path.join(__dirname, 'muse-register.js');
         try {
@@ -2831,6 +2832,7 @@ function spawnMuseDebugWorker({ task, url, account, birthday, clickSignup, netwo
                 MUSE_CLICK_SIGNUP: clickSignup ? '1' : '0',
                 MUSE_NETWORK_LOG: networkLog ? '1' : '0',
                 MUSE_VIDEO: video ? '1' : '0',
+                MUSE_HUMANIZE: humanize ? '1' : '0',
                 MUSE_PROXY: proxy,
                 MUSE_JOB_KEY: task.jobKey
             };

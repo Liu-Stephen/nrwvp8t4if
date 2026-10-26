@@ -2739,6 +2739,9 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                     <label style="display: flex; align-items: center; gap: 6px;">
                         <input type="checkbox" id="muse_record_video" checked> 录制全程视频
                     </label>
+                    <label style="display: flex; align-items: center; gap: 6px;">
+                        <input type="checkbox" id="muse_humanize" checked> 模拟真人操作（随机停顿 / 逐字符输入）
+                    </label>
                 </div>
                 <div style="display: flex; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap;">
                     <button class="btn btn-primary" onclick="startMuseDebug()" id="muse_start_btn">
@@ -8309,6 +8312,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             const clickSignup = Boolean(document.getElementById('muse_click_signup')?.checked);
             const networkLog = Boolean(document.getElementById('muse_network_log')?.checked);
             const video = Boolean(document.getElementById('muse_record_video')?.checked);
+            const humanize = Boolean(document.getElementById('muse_humanize')?.checked);
             const btn = document.getElementById('muse_start_btn');
 
             if (btn) {
@@ -8329,6 +8333,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                         proxy,
                         click_signup: clickSignup,
                         network_log: networkLog,
+                        humanize,
                         video
                     })
                 });
