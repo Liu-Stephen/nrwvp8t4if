@@ -1350,6 +1350,20 @@ async function run() {
                                     await dumpPage(page, '07-after-birthday');
                                     markProgress(98);
                                     await dumpExtraPages(context, page, '07-after-birthday-page');
+
+                                    // 生日过了以后这屏已经是 muse.ai/access/disclosure（无输入框，只有 Get started）。
+                                    // 点下去才知道 144623 里那个 POST /api/auth/check 403 是不是真挡住下一步。
+                                    const getStarted = page.locator('button', { hasText: 'Get started' }).first();
+                                    if (await getStarted.count()) {
+                                        if (!await humanClick(page, getStarted)) {
+                                            console.log('[Muse] Get started 没点到，照样导出现场。');
+                                        }
+                                        await settleAfterAction(page);
+                                        await dumpPage(page, '08-after-disclosure');
+                                        await dumpExtraPages(context, page, '08-after-disclosure-page');
+                                    } else {
+                                        console.log('[Muse] 没有 Get started 按钮，侦察到此为止。');
+                                    }
                                 }
                             }
                         }
