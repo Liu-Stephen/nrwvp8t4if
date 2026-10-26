@@ -8046,6 +8046,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
         let museDebugStatusPollTimer = null;
         let museDebugVideoPath = '';
         let museDebugScreenshotSignature = '';
+        let museOtpDelivered = false;
 
         function clearMuseDebug() {
             stopMuseDebugLogStream();
@@ -8068,6 +8069,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             if (otpWrap) otpWrap.style.display = 'none';
             const otpInput = document.getElementById('muse_otp_input');
             if (otpInput) otpInput.value = '';
+            museOtpDelivered = false;
         }
 
         function appendMuseDebugLogEntries(entries) {
@@ -8198,7 +8200,10 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             }
             const otpWrap = document.getElementById('muse_otp_wrap');
             if (otpWrap) {
-                otpWrap.style.display = (status === 'manual' && museDebugJobKey) ? 'flex' : 'none';
+                // 状态没及时刷回来时，用日志里的 MUSE_INPUT_REQUIRED 兜底。
+                const waiting = museDebugJobKey && (status === 'manual'
+                    || (!museOtpDelivered && /MUSE_INPUT_REQUIRED/.test(museDebugLogText)));
+                otpWrap.style.display = waiting ? 'flex' : 'none';
             }
 
             const shots = Array.isArray(data.screenshots) ? data.screenshots : [];
@@ -8281,6 +8286,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                     throw new Error(data.error || data.message || '提交失败');
                 }
                 showMessage('验证码已下发给脚本', 'success');
+                museOtpDelivered = true;
                 if (input) input.value = '';
                 const wrap = document.getElementById('muse_otp_wrap');
                 if (wrap) wrap.style.display = 'none';

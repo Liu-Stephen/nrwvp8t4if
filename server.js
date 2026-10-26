@@ -2681,7 +2681,7 @@ app.get('/api/admin/checkout/status/:jobKey', async (req, res) => {
 // ─── Muse 注册调试 API ────────────────────────────────────────────────────
 
 const MUSE_DEBUG_CDK = '[muse-debug]';
-const museDebugChildren = new Map();
+const museDebugRuns = new Map();
 
 function parseMuseProgress(output) {
     const matches = String(output || '').match(/MUSE_PROGRESS:\s*(\d{1,3})/g);
@@ -2795,11 +2795,17 @@ app.post('/api/admin/muse/input/:jobKey', async (req, res) => {
         if (code.length < 4) {
             return res.status(400).json({ success: false, error: '验证码至少 4 位数字' });
         }
-        const child = museDebugChildren.get(jobKey);
-        if (!child || !child.stdin || child.stdin.destroyed) {
+        const entry = museDebugRuns.get(jobKey);
+        if (!entry || !entry.child || !entry.child.stdin || entry.child.stdin.destroyed) {
             return res.status(404).json({ success: false, error: '该任务没有在等输入（进程已结束或未到验证码步骤）' });
         }
-        child.stdin.write(`${code}\n`);
+        entry.child.stdin.write(`${code}\n`);
+        entry.awaitingOtp = false;
+        await store.updateTaskLog(jobKey, {
+            status: 'running',
+            message: '验证码已下发，继续执行...',
+            progress: null
+        });
         logTask(jobKey, `已下发验证码 digits=${code.length} 给子进程`);
         return res.json({ success: true, digits: code.length });
     } catch (error) {
@@ -2825,28 +2831,37 @@ function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, vid
             };
 
             let lastProgress = 1;
-            let otpRequested = false;
             const run = await runCheckoutScript(task.jobKey, scriptPath, runtimeEnv, 1, async (_progress, output) => {
-                if (!otpRequested && /MUSE_INPUT_REQUIRED:\s*otp/.test(output)) {
-                    otpRequested = true;
+                const entry = museDebugRuns.get(task.jobKey);
+                if (!entry) {
+                    return;
+                }
+                // output 是累计缓冲，标记会一直在里面，所以按出现次数判断是否有新的一次请求。
+                const requested = (output.match(/MUSE_INPUT_REQUIRED:\s*(\w+)/g) || []).length;
+                if (requested > entry.inputRequests) {
+                    entry.inputRequests = requested;
+                    entry.awaitingOtp = true;
                     await store.updateTaskLog(task.jobKey, {
                         status: 'manual',
                         message: '验证码已发送，请在下方填入 6 位验证码',
                         progress: lastProgress
                     });
                     logTask(task.jobKey, '第二屏已出现验证码输入框，等待后台人工填入');
+                    return;
                 }
                 const next = parseMuseProgress(output);
                 if (next > lastProgress) {
                     lastProgress = next;
-                    await store.updateTaskLog(task.jobKey, {
-                        status: 'running',
-                        message: 'Muse 侦察进行中...',
-                        progress: next
-                    });
+                    if (!entry.awaitingOtp) {
+                        await store.updateTaskLog(task.jobKey, {
+                            status: 'running',
+                            message: 'Muse 侦察进行中...',
+                            progress: next
+                        });
+                    }
                 }
             }, (child) => {
-                museDebugChildren.set(task.jobKey, child);
+                museDebugRuns.set(task.jobKey, { child, awaitingOtp: false, inputRequests: 0 });
             });
 
             const media = extractTaskMediaFromOutput(run.output);
@@ -2873,7 +2888,7 @@ function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, vid
                 progress: 1
             });
         } finally {
-            museDebugChildren.delete(task.jobKey);
+            museDebugRuns.delete(task.jobKey);
         }
     })();
 }
