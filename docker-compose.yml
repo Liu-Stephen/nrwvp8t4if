@@ -63,6 +63,17 @@ services:
       BROWSER_POOL_SIZE: ${BROWSER_POOL_SIZE:-2}
       BROWSER_POOL_MAX_SIZE: ${BROWSER_POOL_MAX_SIZE:-24}
       BROWSER_POOL_BASE_PORT: ${BROWSER_POOL_BASE_PORT:-19222}
+      MUSE_URL: ${MUSE_URL:-https://muse.ai/}
+      MUSE_HEADFUL: ${MUSE_HEADFUL:-0}
+      MUSE_KEEP_OPEN: ${MUSE_KEEP_OPEN:-0}
+      MUSE_CLICK_SIGNUP: ${MUSE_CLICK_SIGNUP:-1}
+      MUSE_NETWORK_LOG: ${MUSE_NETWORK_LOG:-1}
+      MUSE_PROXY: ${MUSE_PROXY:-}
+      MUSE_DEBUG_DIR: ${MUSE_DEBUG_DIR:-/app/debug_screenshots/muse-debug}
+      MUSE_NAV_TIMEOUT_MS: ${MUSE_NAV_TIMEOUT_MS:-90000}
+      MUSE_SETTLE_MS: ${MUSE_SETTLE_MS:-3000}
+      MUSE_CDP_PORT: ${MUSE_CDP_PORT:-9333}
+      MUSE_CHROMIUM_CHANNEL: ${MUSE_CHROMIUM_CHANNEL:-}
     volumes:
       - ./debug_screenshots:/app/debug_screenshots
       - ./data:/app/data
@@ -90,6 +101,7 @@ services:
       - ./browser-pool-client.js:/app/browser-pool-client.js
       - ./browser-standalone.js:/app/browser-standalone.js
       - ./browser-runtime.js:/app/browser-runtime.js
+      - ./muse-register.js:/app/muse-register.js
       - ./admin-auth.js:/app/admin-auth.js
       - ./admin-paths.js:/app/admin-paths.js
       - ./gpt-api-client.js:/app/gpt-api-client.js
