@@ -16,6 +16,7 @@
  *   docker compose exec app node muse-register.js
  *
  * 输出目录默认 debug_screenshots/muse-debug/<时间戳>/；Docker 下该目录已 bind mount 到宿主机。
+ * 每个步骤同时输出 LIVE_SCREENSHOT / VIDEO_FILE 标记，后台「Muse 注册调试」页会实时收集展示。
  */
 
 const fs = require('fs');
@@ -39,6 +40,8 @@ const CONFIG = {
         : Boolean(process.stdin.isTTY),
     clickSignup: String(process.env.MUSE_CLICK_SIGNUP || '1') !== '0',
     networkLog: String(process.env.MUSE_NETWORK_LOG || '1') !== '0',
+    video: String(process.env.MUSE_VIDEO || '1') !== '0',
+    videoDir: path.resolve(process.env.MUSE_VIDEO_DIR || path.join(__dirname, 'debug_screenshots', 'videos')),
     proxy: String(process.env.MUSE_PROXY || '').trim(),
     chromiumChannel: String(process.env.MUSE_CHROMIUM_CHANNEL || '').trim(),
     cdpPort: String(process.env.MUSE_CDP_PORT || '9333').trim(),
@@ -47,6 +50,11 @@ const CONFIG = {
 };
 
 const RUN_DIR = path.join(CONFIG.debugRoot, stamp());
+const VIDEO_TAG = String(process.env.MUSE_JOB_KEY || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) || stamp();
+
+function markProgress(value) {
+    console.log(`MUSE_PROGRESS: ${value}`);
+}
 
 function sanitizeUrl(raw) {
     const value = String(raw || '').trim();
@@ -393,6 +401,9 @@ async function dumpPage(page, label) {
     } catch (_) {
         await page.screenshot({ path: `${base}.png`, fullPage: false, timeout: 30000 }).catch(() => {});
     }
+    if (fs.existsSync(`${base}.png`)) {
+        console.log(`LIVE_SCREENSHOT: ${base}.png`);
+    }
 
     try {
         fs.writeFileSync(`${base}.html`, await page.content(), 'utf8');
@@ -522,6 +533,59 @@ function waitForEnter(message) {
     });
 }
 
+function collectVideoHandles(context) {
+    if (!context || typeof context.pages !== 'function') {
+        return [];
+    }
+    const handles = [];
+    for (const item of context.pages()) {
+        try {
+            const video = item.video ? item.video() : null;
+            if (video) handles.push(video);
+        } catch (_) {
+            // 页面可能已关闭，忽略。
+        }
+    }
+    return handles;
+}
+
+async function finalizeVideo(context) {
+    if (!CONFIG.video || !context) {
+        if (context) await context.close().catch(() => {});
+        return [];
+    }
+
+    const handles = collectVideoHandles(context);
+    await context.close().catch(() => {});
+    if (!handles.length) {
+        return [];
+    }
+
+    fs.mkdirSync(CONFIG.videoDir, { recursive: true });
+    const saved = [];
+    for (let i = 0; i < handles.length; i += 1) {
+        const rawPath = await handles[i].path().catch(() => null);
+        if (!rawPath) continue;
+        const finalPath = path.join(CONFIG.videoDir, `muse_${VIDEO_TAG}_${i + 1}_${Date.now()}.webm`);
+        try {
+            fs.renameSync(rawPath, finalPath);
+        } catch (_) {
+            try {
+                fs.copyFileSync(rawPath, finalPath);
+                fs.unlinkSync(rawPath);
+            } catch (_) {
+                saved.push(rawPath);
+                console.log(`VIDEO_FILE: ${rawPath}`);
+                continue;
+            }
+        }
+        saved.push(finalPath);
+        console.log(`[Muse] 录像已保存: ${finalPath}`);
+        console.log(`VIDEO_FILE: ${finalPath}`);
+    }
+    return saved;
+}
+
 async function run() {
     fs.mkdirSync(RUN_DIR, { recursive: true });
 
@@ -534,6 +598,7 @@ async function run() {
     let context = null;
     let page = null;
     let networkLog = null;
+    let failed = false;
 
     try {
         session = await connectStandaloneBrowser({
@@ -547,8 +612,10 @@ async function run() {
             viewport: { width: 1440, height: 900 },
             locale: 'en-US',
             timezoneId: 'America/Chicago',
-            ignoreHTTPSErrors: true
+            ignoreHTTPSErrors: true,
+            ...(CONFIG.video ? { recordVideo: { dir: CONFIG.videoDir, size: { width: 1440, height: 900 } } } : {})
         });
+        markProgress(15);
 
         networkLog = attachNetworkLog(context);
         page = await context.newPage();
@@ -562,11 +629,13 @@ async function run() {
         await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
         await page.waitForTimeout(1500);
         await dumpPage(page, '01-home');
+        markProgress(40);
 
         if (CONFIG.clickSignup) {
             const authReady = await hasAuthInput(page);
             if (authReady) {
                 console.log('[Muse] 首页已经出现邮箱/手机号输入框，跳过注册入口点击');
+                markProgress(70);
             } else {
                 const candidates = await findSignupCandidates(page);
                 printCandidates(candidates);
@@ -581,6 +650,7 @@ async function run() {
                     );
 
                     const popupPromise = page.waitForEvent('popup', { timeout: 5000 }).catch(() => null);
+                    markProgress(55);
                     try {
                         await clickCandidate(target);
                     } catch (error) {
@@ -591,11 +661,13 @@ async function run() {
                     await page.waitForTimeout(CONFIG.settleMs);
                     await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
                     await dumpPage(page, '02-after-signup-click');
+                    markProgress(80);
 
                     if (popup) {
                         await popup.waitForLoadState('domcontentloaded', { timeout: CONFIG.navigationTimeoutMs }).catch(() => {});
                         await popup.waitForTimeout(1500);
                         await dumpPage(popup, '03-popup');
+                        markProgress(88);
                     }
 
                     const seen = new Set([page, popup].filter(Boolean));
@@ -608,6 +680,7 @@ async function run() {
             }
         }
     } catch (error) {
+        failed = true;
         console.error(`[Muse] 侦察失败: ${error.stack || error.message}`);
         if (page) {
             await dumpPage(page, '99-error').catch(() => {});
@@ -617,10 +690,15 @@ async function run() {
         if (CONFIG.keepOpen && context) {
             await waitForEnter('[Muse] 浏览器保持打开，按 Enter 关闭... ');
         }
-        if (context) await context.close().catch(() => {});
+        markProgress(95);
+        await finalizeVideo(context);
         if (session && session.browser) await session.browser.close().catch(() => {});
         if (networkLog) networkLog.close();
         if (preparedProxy && preparedProxy.cleanup) await preparedProxy.cleanup().catch(() => {});
+        if (!failed) {
+            console.log('MUSE_DEBUG_DONE');
+            markProgress(100);
+        }
         console.log(`[Muse] 结束，日志在 ${RUN_DIR}`);
     }
 }

@@ -2675,6 +2675,167 @@ app.get('/api/admin/checkout/status/:jobKey', async (req, res) => {
     }
 });
 
+// ─── Muse 注册调试 API ────────────────────────────────────────────────────
+
+const MUSE_DEBUG_CDK = '[muse-debug]';
+
+function parseMuseProgress(output) {
+    const matches = String(output || '').match(/MUSE_PROGRESS:\s*(\d{1,3})/g);
+    if (!matches || !matches.length) {
+        return 0;
+    }
+    const value = Number((matches[matches.length - 1].match(/(\d{1,3})/) || [])[1] || 0);
+    return Math.max(0, Math.min(value, 99));
+}
+
+function collectMuseMedia(task, jobKey) {
+    let stored = [];
+    if (task.failure_screenshots) {
+        try {
+            const parsed = JSON.parse(task.failure_screenshots);
+            if (Array.isArray(parsed)) stored = parsed;
+        } catch (_) { /* ignore */ }
+    }
+    const fromStored = splitTaskMediaPaths(stored);
+    const fromOutput = extractTaskMediaFromOutput(task.raw_output || '');
+    // 运行中的任务 raw_output 尚未落库，从环形运行日志里取已产出的截图/录像
+    const liveText = runtimeLog.tail(4000)
+        .filter((entry) => entry.jobKey === jobKey)
+        .map((entry) => entry.text)
+        .join('\n');
+    const live = extractTaskMediaFromOutput(liveText);
+
+    return {
+        screenshots: [...new Set([...fromStored.screenshots, ...fromOutput.screenshots, ...live.screenshots])],
+        videos: [...new Set([...fromStored.videos, ...fromOutput.videos, ...live.videos])]
+    };
+}
+
+app.post('/api/admin/muse/start', async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const body = req.body || {};
+        const url = String(body.url || 'https://muse.ai/').trim() || 'https://muse.ai/';
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(url);
+        } catch (_) {
+            return res.status(400).json({ success: false, error: '无效的页面地址' });
+        }
+        if (!/^https?:$/.test(parsedUrl.protocol)) {
+            return res.status(400).json({ success: false, error: '仅支持 http/https 地址' });
+        }
+
+        const clickSignup = body.click_signup !== false;
+        const networkLog = body.network_log !== false;
+        const video = body.video !== false;
+        const proxy = String(body.proxy || '').trim();
+
+        const task = await store.createTaskLog({
+            tokenPreview: 'muse.ai',
+            sessionPayload: null,
+            cdkCode: MUSE_DEBUG_CDK,
+            phone: null,
+            cardLast4: null,
+            status: 'running',
+            progress: 1
+        });
+        await store.updateTaskLog(task.jobKey, {
+            status: 'running',
+            message: 'Muse 侦察启动中...',
+            progress: 1
+        });
+        logTask(task.jobKey, `Muse 注册调试任务已创建 url=${url} proxy=${proxy ? 'yes' : 'no'} video=${video ? 'yes' : 'no'}`);
+        spawnMuseDebugWorker({ task, url, clickSignup, networkLog, video, proxy });
+
+        return res.json({ success: true, jobKey: task.jobKey });
+    } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+app.get('/api/admin/muse/status/:jobKey', async (req, res) => {
+    try {
+        await ensureStoreReady();
+        const jobKey = decodeURIComponent(String(req.params.jobKey || '').trim());
+        if (!jobKey) {
+            return res.status(400).json({ success: false, error: '缺少 jobKey' });
+        }
+        const task = await store.getTaskStatus(jobKey);
+        if (!task) {
+            return res.status(404).json({ success: false, error: '任务不存在' });
+        }
+        const media = collectMuseMedia(task, jobKey);
+        return res.json({
+            success: true,
+            jobKey,
+            status: task.status,
+            message: task.message,
+            progress: Number(task.progress || 0),
+            screenshots: media.screenshots,
+            videos: media.videos
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+function spawnMuseDebugWorker({ task, url, clickSignup, networkLog, video, proxy }) {
+    (async () => {
+        const scriptPath = path.join(__dirname, 'muse-register.js');
+        try {
+            const runtimeEnv = {
+                ...process.env,
+                MUSE_URL: url,
+                MUSE_HEADFUL: '0',
+                MUSE_KEEP_OPEN: '0',
+                MUSE_CLICK_SIGNUP: clickSignup ? '1' : '0',
+                MUSE_NETWORK_LOG: networkLog ? '1' : '0',
+                MUSE_VIDEO: video ? '1' : '0',
+                MUSE_PROXY: proxy,
+                MUSE_JOB_KEY: task.jobKey
+            };
+
+            let lastProgress = 1;
+            const run = await runCheckoutScript(task.jobKey, scriptPath, runtimeEnv, 1, async (_progress, output) => {
+                const next = parseMuseProgress(output);
+                if (next > lastProgress) {
+                    lastProgress = next;
+                    await store.updateTaskLog(task.jobKey, {
+                        status: 'running',
+                        message: 'Muse 侦察进行中...',
+                        progress: next
+                    });
+                }
+            });
+
+            const media = extractTaskMediaFromOutput(run.output);
+            const success = run.code === 0 && String(run.output).includes('MUSE_DEBUG_DONE');
+            const message = success
+                ? `Muse 侦察完成：${media.screenshots.length} 张截图${media.videos.length ? `、${media.videos.length} 段录像` : ''}`
+                : `Muse 侦察失败${run.timedOut ? '（无输出超时）' : ''}：${extractRuntimeErrorMessage(run.output) || `子进程退出 code=${run.code}`}`;
+
+            await store.updateTaskLog(task.jobKey, {
+                status: success ? 'success' : 'failed',
+                message,
+                rawOutput: String(run.output || '').slice(-60000),
+                progress: success ? 100 : Math.max(lastProgress, 1),
+                failureScreenshots: [...media.screenshots, ...media.videos]
+            });
+
+            logTask(task.jobKey, `侦察结束 status=${success ? 'success' : 'failed'} screenshots=${media.screenshots.length} videos=${media.videos.length}`);
+        } catch (error) {
+            console.error(`[Muse Debug] ${task.jobKey}:`, error);
+            logTask(task.jobKey, `侦察任务异常: ${error.message}`, 'error');
+            await store.updateTaskLog(task.jobKey, {
+                status: 'failed',
+                message: error.message,
+                progress: 1
+            });
+        }
+    })();
+}
+
 // ─── Card Pool Management API ───────────────────────────────────────────────
 
 app.get('/api/admin/cards', requireSecondaryAuth, async (req, res) => {

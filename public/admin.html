@@ -1783,6 +1783,9 @@
                     <div class="nav-item nav-subitem" onclick="switchPage('checkout_debug', this)" data-page="checkout_debug">
                         <span>支付链接调试</span>
                     </div>
+                    <div class="nav-item nav-subitem" onclick="switchPage('muse_debug', this)" data-page="muse_debug">
+                        <span>Muse 注册调试</span>
+                    </div>
                     <div class="nav-item nav-subitem" onclick="switchPage('cards', this)" data-page="cards">
                         <span>银行卡池</span>
                     </div>
@@ -2699,6 +2702,77 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             </div>
         </div>
 
+        <!-- Muse 注册调试 -->
+        <div id="muse_debug" class="page-view">
+            <div class="page-header">
+                <h1>Muse 注册调试</h1>
+                <p>在服务器上启动 Playwright 打开 muse.ai，自动点击注册/登录入口并导出页面结构、步骤截图与全程录像（当前版本不填邮箱、不提交验证码）</p>
+            </div>
+
+            <div class="panel">
+                <h2 class="panel-title">启动参数</h2>
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 16px;">
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label style="margin-bottom: 6px;">起始地址</label>
+                        <input type="text" id="muse_url_input" class="asset-input" value="https://muse.ai/" autocomplete="off">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label style="margin-bottom: 6px;">代理（留空直连）</label>
+                        <input type="text" id="muse_proxy_input" class="asset-input" placeholder="http://user:pass@host:port" autocomplete="off">
+                    </div>
+                </div>
+                <div style="display: flex; gap: 20px; margin-top: 14px; flex-wrap: wrap; font-size: 13px;">
+                    <label style="display: flex; align-items: center; gap: 6px;">
+                        <input type="checkbox" id="muse_click_signup" checked> 自动点击注册/登录入口
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px;">
+                        <input type="checkbox" id="muse_network_log" checked> 记录网络请求
+                    </label>
+                    <label style="display: flex; align-items: center; gap: 6px;">
+                        <input type="checkbox" id="muse_record_video" checked> 录制全程视频
+                    </label>
+                </div>
+                <div style="display: flex; align-items: center; gap: 12px; margin-top: 16px; flex-wrap: wrap;">
+                    <button class="btn btn-primary" onclick="startMuseDebug()" id="muse_start_btn">
+                        <i data-lucide="play"></i>
+                        启动 Muse 侦察
+                    </button>
+                    <button type="button" class="btn btn-secondary" onclick="clearMuseDebug()">
+                        清空
+                    </button>
+                    <span id="muse_job_hint" style="font-size: 12px; color: var(--text-dim);"></span>
+                </div>
+            </div>
+
+            <div id="muse_result_box" class="panel" style="display: none; margin-top: 24px;">
+                <h2 class="panel-title">任务状态</h2>
+                <div id="muse_result_status" style="font-weight: 600; margin-top: 12px; margin-bottom: 8px;"></div>
+                <div id="muse_result_message" style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"></div>
+                <div id="muse_video_wrap" style="margin-bottom: 12px;"></div>
+                <div id="muse_screenshot_wrap"></div>
+            </div>
+
+            <div class="panel" style="margin-top: 24px;">
+                <div class="runtime-log-toolbar">
+                    <h2 class="panel-title" style="margin: 0;">运行日志</h2>
+                    <label class="runtime-log-toggle">
+                        <input type="checkbox" id="muse_log_autoscroll" checked>
+                        <span>自动滚动</span>
+                    </label>
+                    <button type="button" class="btn btn-primary" onclick="refreshMuseDebugLogs()">
+                        <i data-lucide="refresh-cw"></i> 刷新
+                    </button>
+                    <button type="button" class="btn btn-secondary" onclick="switchPage('runtime_logs', document.querySelector('.nav-item[onclick*=\'runtime_logs\']'))">
+                        打开完整运行日志
+                    </button>
+                </div>
+                <p style="font-size: 12px; color: var(--text-dim); margin: 8px 0 12px;">仅显示当前 Muse 侦察任务；每完成一步会保存截图，结束时输出录像文件。</p>
+                <div class="runtime-log-pre-wrap">
+                    <pre id="muse_debug_log_pre" class="runtime-log-pre" spellcheck="false"></pre>
+                </div>
+            </div>
+        </div>
+
         <!-- 银行卡池 -->
         <div id="cards" class="page-view">
             <div class="page-header">
@@ -3221,7 +3295,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
     <script>
         const TOKEN_KEY = 'plus_admin_token';
         let adminLoginPath = '/admin-login';
-        const BUSINESS_PAGES = new Set(['checkout_debug', 'cards', 'cdks', 'sessions', 'billing']);
+        const BUSINESS_PAGES = new Set(['checkout_debug', 'muse_debug', 'cards', 'cdks', 'sessions', 'billing']);
         const ADMIN_LOGIN_EVENT_LABELS = {
             login_success: '登录成功',
             login_failed: '登录失败',
@@ -3869,6 +3943,24 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                 return '';
             }
             return `/api/admin/screenshots?path=${encodeURIComponent(normalized)}`;
+        }
+
+        function buildVideoApiPath(relativePath) {
+            const normalized = String(relativePath || '').replace(/\\/g, '/').replace(/^\/+/, '');
+            if (!normalized) {
+                return '';
+            }
+            return `/api/admin/video?path=${encodeURIComponent(normalized)}`;
+        }
+
+        function buildScreenshotUrl(relativePath) {
+            const apiPath = buildScreenshotApiPath(relativePath);
+            return apiPath ? `${apiPath}&token=${encodeURIComponent(getAdminToken() || '')}` : '';
+        }
+
+        function buildVideoUrl(relativePath) {
+            const apiPath = buildVideoApiPath(relativePath);
+            return apiPath ? `${apiPath}&token=${encodeURIComponent(getAdminToken() || '')}` : '';
         }
 
         document.addEventListener('click', (event) => {
@@ -4833,6 +4925,12 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                 startCheckoutDebugLogStream();
             } else {
                 stopCheckoutDebugLogStream();
+            }
+
+            if (pId === 'muse_debug') {
+                startMuseDebugLogStream();
+            } else {
+                stopMuseDebugLogStream();
             }
 
             if (pId === 'tax_addresses') {
@@ -7927,6 +8025,260 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             if (sel) sel.value = currentRegion;
             onCheckoutRegionChange();
             lucide.createIcons();
+        }
+
+        // ─── Muse 注册调试 ───────────────────────────────────────────────
+        let museDebugJobKey = '';
+        let museDebugLogAfter = 0;
+        let museDebugLogText = '';
+        let museDebugLogPollTimer = null;
+        let museDebugStatusPollTimer = null;
+        let museDebugVideoPath = '';
+        let museDebugScreenshotSignature = '';
+
+        function clearMuseDebug() {
+            stopMuseDebugLogStream();
+            museDebugJobKey = '';
+            museDebugLogAfter = 0;
+            museDebugLogText = '';
+            museDebugVideoPath = '';
+            museDebugScreenshotSignature = '';
+            const pre = document.getElementById('muse_debug_log_pre');
+            if (pre) pre.textContent = '';
+            const box = document.getElementById('muse_result_box');
+            if (box) box.style.display = 'none';
+            const shotWrap = document.getElementById('muse_screenshot_wrap');
+            if (shotWrap) shotWrap.innerHTML = '';
+            const videoWrap = document.getElementById('muse_video_wrap');
+            if (videoWrap) videoWrap.innerHTML = '';
+            const hint = document.getElementById('muse_job_hint');
+            if (hint) hint.textContent = '';
+        }
+
+        function appendMuseDebugLogEntries(entries) {
+            if (!entries || !entries.length || !museDebugJobKey) {
+                return;
+            }
+            const filtered = entries.filter((entry) => entry.jobKey === museDebugJobKey);
+            if (!filtered.length) {
+                return;
+            }
+            museDebugLogText += filtered.map(formatRuntimeLogLine).join('\n') + '\n';
+            if (museDebugLogText.length > 120000) {
+                museDebugLogText = museDebugLogText.slice(-100000);
+            }
+            const pre = document.getElementById('muse_debug_log_pre');
+            if (!pre) return;
+            pre.textContent = museDebugLogText;
+            const autoscroll = document.getElementById('muse_log_autoscroll');
+            const wrap = pre.parentElement;
+            if (autoscroll && autoscroll.checked && wrap) {
+                wrap.scrollTop = wrap.scrollHeight;
+            }
+        }
+
+        function stopMuseDebugLogStream() {
+            if (museDebugLogPollTimer) {
+                clearInterval(museDebugLogPollTimer);
+                museDebugLogPollTimer = null;
+            }
+            if (museDebugStatusPollTimer) {
+                clearInterval(museDebugStatusPollTimer);
+                museDebugStatusPollTimer = null;
+            }
+        }
+
+        async function fetchMuseDebugLogsTail() {
+            const res = await authFetch('/api/admin/runtime-logs?tail=1&limit=2000');
+            const data = await res.json();
+            if (!data.success) {
+                throw new Error(data.message || '加载日志失败');
+            }
+            museDebugLogAfter = Number(data.nextAfter || 0);
+            if (!museDebugJobKey) {
+                return;
+            }
+            const filtered = (data.entries || []).filter((entry) => entry.jobKey === museDebugJobKey);
+            museDebugLogText = filtered.map(formatRuntimeLogLine).join('\n');
+            if (museDebugLogText) museDebugLogText += '\n';
+            const pre = document.getElementById('muse_debug_log_pre');
+            if (pre) {
+                pre.textContent = museDebugLogText;
+                const wrap = pre.parentElement;
+                const autoscroll = document.getElementById('muse_log_autoscroll');
+                if (autoscroll && autoscroll.checked && wrap) {
+                    wrap.scrollTop = wrap.scrollHeight;
+                }
+            }
+        }
+
+        async function fetchMuseDebugLogsIncremental() {
+            if (!museDebugJobKey) return;
+            try {
+                const res = await authFetch(`/api/admin/runtime-logs?after=${museDebugLogAfter}&limit=500`);
+                const data = await res.json();
+                if (!data.success) return;
+                if (data.entries && data.entries.length) {
+                    appendMuseDebugLogEntries(data.entries);
+                }
+                museDebugLogAfter = Number(data.nextAfter || museDebugLogAfter);
+            } catch (_) { /* ignore */ }
+        }
+
+        function startMuseDebugLogStream() {
+            stopMuseDebugLogStream();
+            if (!museDebugJobKey) {
+                return;
+            }
+            fetchMuseDebugLogsTail().catch(() => { });
+            museDebugLogPollTimer = setInterval(() => {
+                fetchMuseDebugLogsIncremental();
+            }, 1500);
+            museDebugStatusPollTimer = setInterval(() => {
+                pollMuseDebugStatus(false);
+            }, 2000);
+        }
+
+        async function refreshMuseDebugLogs() {
+            try {
+                await fetchMuseDebugLogsTail();
+                await pollMuseDebugStatus(true);
+                showMessage('日志已刷新', 'success');
+            } catch (e) {
+                showMessage(e.message || '刷新失败', 'error');
+            }
+        }
+
+        function renderMuseDebugStatus(data) {
+            const box = document.getElementById('muse_result_box');
+            const statusEl = document.getElementById('muse_result_status');
+            const messageEl = document.getElementById('muse_result_message');
+            const shotWrap = document.getElementById('muse_screenshot_wrap');
+            const videoWrap = document.getElementById('muse_video_wrap');
+            const hint = document.getElementById('muse_job_hint');
+            if (box) box.style.display = 'block';
+            if (hint && museDebugJobKey) {
+                hint.textContent = `Job: ${museDebugJobKey}`;
+            }
+
+            const status = data.status || 'running';
+            const progress = Number(data.progress || 0);
+            if (statusEl) {
+                if (status === 'success') {
+                    statusEl.textContent = '✅ Muse 侦察完成';
+                    statusEl.style.color = 'var(--success, #22c55e)';
+                } else if (status === 'running') {
+                    statusEl.textContent = `⏳ Muse 侦察进行中... ${progress}%`;
+                    statusEl.style.color = 'var(--text-dim)';
+                } else {
+                    statusEl.textContent = '❌ Muse 侦察失败';
+                    statusEl.style.color = 'var(--error, #ef4444)';
+                }
+            }
+            if (messageEl) {
+                messageEl.textContent = data.message || '';
+            }
+
+            const shots = Array.isArray(data.screenshots) ? data.screenshots : [];
+            const signature = shots.join('|');
+            if (shotWrap && signature !== museDebugScreenshotSignature) {
+                museDebugScreenshotSignature = signature;
+                if (shots.length) {
+                    const cacheBust = Date.now();
+                    shotWrap.innerHTML = `<div style="font-size:13px; margin-bottom:8px; color:var(--text-dim);">步骤截图 (${shots.length})</div>`
+                        + shots.map((p) => `
+                            <div style="margin-bottom:14px;">
+                                <div style="font-size:12px; color:var(--text-dim); margin-bottom:6px;">${escapeHtml(p)}</div>
+                                <a href="${buildScreenshotUrl(p)}" target="_blank" rel="noopener">
+                                    <img src="${buildScreenshotUrl(p)}&v=${cacheBust}" alt="${escapeHtml(p)}" style="max-width:100%; border-radius:8px; border:1px solid var(--divider);">
+                                </a>
+                            </div>
+                        `).join('');
+                } else {
+                    shotWrap.innerHTML = '';
+                }
+            }
+
+            const videos = Array.isArray(data.videos) ? data.videos : [];
+            const videoPath = videos[videos.length - 1] || '';
+            if (videoWrap && videoPath && videoPath !== museDebugVideoPath) {
+                museDebugVideoPath = videoPath;
+                videoWrap.innerHTML = `
+                    <div style="font-size:13px; color:var(--text-dim); margin-bottom:6px;">全程录像：${escapeHtml(videoPath)}</div>
+                    <video src="${buildVideoUrl(videoPath)}" controls preload="metadata" style="width:100%; max-width:960px; border-radius:8px; background:#000;"></video>
+                `;
+            }
+        }
+
+        async function pollMuseDebugStatus(forceToast) {
+            if (!museDebugJobKey) return;
+            try {
+                const res = await authFetch(`/api/admin/muse/status/${encodeURIComponent(museDebugJobKey)}`);
+                const data = await res.json();
+                if (!data.success) return;
+                renderMuseDebugStatus(data);
+                if (data.status === 'success' || data.status === 'failed') {
+                    if (museDebugStatusPollTimer) {
+                        clearInterval(museDebugStatusPollTimer);
+                        museDebugStatusPollTimer = null;
+                    }
+                    const btn = document.getElementById('muse_start_btn');
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.innerHTML = '<i data-lucide="play"></i> 启动 Muse 侦察';
+                        lucide.createIcons();
+                    }
+                    if (forceToast) {
+                        showMessage(data.status === 'success' ? 'Muse 侦察完成' : (data.message || '侦察失败'), data.status === 'success' ? 'success' : 'error');
+                    }
+                }
+            } catch (_) { /* ignore */ }
+        }
+
+        async function startMuseDebug() {
+            const url = document.getElementById('muse_url_input')?.value?.trim() || 'https://muse.ai/';
+            const proxy = document.getElementById('muse_proxy_input')?.value?.trim() || '';
+            const clickSignup = Boolean(document.getElementById('muse_click_signup')?.checked);
+            const networkLog = Boolean(document.getElementById('muse_network_log')?.checked);
+            const video = Boolean(document.getElementById('muse_record_video')?.checked);
+            const btn = document.getElementById('muse_start_btn');
+
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = '<i data-lucide="loader"></i> 启动中...';
+                lucide.createIcons();
+            }
+            clearMuseDebug();
+
+            try {
+                const res = await authFetch('/api/admin/muse/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        url,
+                        proxy,
+                        click_signup: clickSignup,
+                        network_log: networkLog,
+                        video
+                    })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.success) {
+                    throw new Error(data.error || data.message || '启动失败');
+                }
+
+                museDebugJobKey = data.jobKey;
+                renderMuseDebugStatus({ status: 'running', message: '启动中...', progress: 1, screenshots: [], videos: [] });
+                showMessage(`Muse 侦察已启动：${data.jobKey}`, 'success');
+                startMuseDebugLogStream();
+            } catch (e) {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = '<i data-lucide="play"></i> 启动 Muse 侦察';
+                    lucide.createIcons();
+                }
+                showMessage(e.message || '启动失败', 'error');
+            }
         }
 
         function renderCheckoutPlanTypeOptions() {
