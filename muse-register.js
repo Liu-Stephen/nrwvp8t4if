@@ -44,6 +44,7 @@ const CONFIG = {
     videoDir: path.resolve(process.env.MUSE_VIDEO_DIR || path.join(__dirname, 'debug_screenshots', 'videos')),
     proxy: String(process.env.MUSE_PROXY || '').trim(),
     account: String(process.env.MUSE_ACCOUNT || '').trim().slice(0, 320),
+    birthday: String(process.env.MUSE_BIRTHDAY || '').trim().slice(0, 32),
     chromiumChannel: String(process.env.MUSE_CHROMIUM_CHANNEL || '').trim(),
     cdpPort: String(process.env.MUSE_CDP_PORT || '9333').trim(),
     navigationTimeoutMs: Number(process.env.MUSE_NAV_TIMEOUT_MS || 90000),
@@ -95,6 +96,31 @@ function maskAccount(value) {
         return `${local.slice(0, 2)}***@${domain}`;
     }
     return `${text.slice(0, 3)}***${text.slice(-2)}`;
+}
+
+// 生日留空时随机取 22~32 岁；日只到 28，避免造出非法日期。
+function resolveBirthday() {
+    const raw = CONFIG.birthday;
+    const matched = /^(\d{4})-(\d{2})-(\d{2})$/.exec(raw);
+    if (matched) {
+        const year = Number(matched[1]);
+        const month = Number(matched[2]);
+        const day = Number(matched[3]);
+        const date = new Date(Date.UTC(year, month - 1, day));
+        if (date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day) {
+            return { year, month, day, source: '指定' };
+        }
+    }
+    if (raw) {
+        console.log(`[Muse] MUSE_BIRTHDAY="${raw}" 不是有效的 YYYY-MM-DD，改用随机生日`);
+    }
+    const age = 22 + Math.floor(Math.random() * 11);
+    return {
+        year: new Date().getUTCFullYear() - age,
+        month: 1 + Math.floor(Math.random() * 12),
+        day: 1 + Math.floor(Math.random() * 28),
+        source: `随机 ${age} 岁`
+    };
 }
 
 function formatButton(button) {
@@ -387,6 +413,75 @@ function tagOtpFields() {
         info.submit = {
             tag: String(submit.tagName || '').toLowerCase(),
             type: attr(submit, 'type'),
+            text: clean(submit.innerText || submit.value || submit.textContent, 60)
+        };
+    }
+    return info;
+}
+
+// 在页面上下文中执行：关掉「Something went wrong」这类模态框（没有则返回 null）。
+function dismissErrorDialog() {
+    const isVisible = (el) => {
+        try {
+            const style = window.getComputedStyle(el);
+            if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+                return false;
+            }
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        } catch (_) {
+            return false;
+        }
+    };
+    const clean = (value, max = 300) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+    const target = Array.from(document.querySelectorAll('button, [role="button"]')).find((el) => {
+        if (!isVisible(el)) return false;
+        if (String(el.getAttribute('aria-label') || '').toLowerCase() === 'close') return true;
+        return clean(el.innerText || el.value || el.textContent, 20).toLowerCase() === 'ok';
+    });
+    if (!target) return null;
+
+    const dialog = target.closest('[role="dialog"], [role="alertdialog"]') || target.parentElement;
+    target.setAttribute('data-muse-dismiss', '1');
+    return {
+        label: clean(target.getAttribute('aria-label') || target.innerText || target.textContent, 30),
+        text: dialog ? clean(dialog.innerText || dialog.textContent) : ''
+    };
+}
+
+// 在页面上下文中执行：标记生日屏的三个隐藏 select（可见的是自定义按钮，别点）和提交按钮。
+function tagBirthdayFields() {
+    const clean = (value, max = 120) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+
+    const pick = (name) => Array.from(document.querySelectorAll('select'))
+        .find((el) => String(el.autocomplete || '').toLowerCase() === name) || null;
+
+    const month = pick('bday-month');
+    const day = pick('bday-day');
+    const year = pick('bday-year');
+    if (!month || !day || !year) return null;
+
+    month.setAttribute('data-muse-bday', 'month');
+    day.setAttribute('data-muse-bday', 'day');
+    year.setAttribute('data-muse-bday', 'year');
+
+    const info = {
+        monthOptions: month.options ? month.options.length : 0,
+        dayOptions: day.options ? day.options.length : 0,
+        yearOptions: year.options ? year.options.length : 0,
+        current: `${month.value}/${day.value}/${year.value}`,
+        submit: null
+    };
+
+    const scope = month.closest('form') || document;
+    const submit = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"]'))
+        .find((el) => !el.disabled) || null;
+    if (submit) {
+        submit.setAttribute('data-muse-bday', 'submit');
+        info.submit = {
+            tag: String(submit.tagName || '').toLowerCase(),
+            type: submit.getAttribute('type') || '',
             text: clean(submit.innerText || submit.value || submit.textContent, 60)
         };
     }
@@ -777,6 +872,84 @@ async function fillOtpAndSubmit(page, code) {
     return false;
 }
 
+async function dismissDialog(page) {
+    for (let round = 0; round < 3; round += 1) {
+        let hit = null;
+        for (const frame of page.frames()) {
+            try {
+                const found = await frame.evaluate(dismissErrorDialog);
+                if (found) {
+                    hit = { frame, found };
+                    break;
+                }
+            } catch (_) {
+                // 跨域或已销毁的 frame，跳过。
+            }
+        }
+        if (!hit) return false;
+        console.log(`[Muse] 关掉弹框 [${hit.found.label}] ${truncate(hit.found.text, 200)}`);
+        await hit.frame.locator('[data-muse-dismiss="1"]').first().click({ timeout: 10000 }).catch((error) => {
+            console.error(`[Muse] 弹框关闭失败: ${error.message}`);
+        });
+        await page.waitForTimeout(500);
+    }
+    return true;
+}
+
+async function fillBirthdayAndSubmit(page, birthday) {
+    const pageFrames = page.frames();
+    for (let i = 0; i < pageFrames.length; i += 1) {
+        const frame = pageFrames[i];
+        let info = null;
+        try {
+            info = await frame.evaluate(tagBirthdayFields);
+        } catch (_) {
+            continue;
+        }
+        if (!info) continue;
+
+        console.log(`[Muse] 生日屏 frame#${i} 当前=${info.current} 选项数=${info.monthOptions}/${info.dayOptions}/${info.yearOptions}`);
+        const picks = [
+            ['month', String(birthday.month)],
+            ['day', String(birthday.day)],
+            ['year', String(birthday.year)]
+        ];
+        for (const [key, value] of picks) {
+            try {
+                await frame.locator(`[data-muse-bday="${key}"]`).first().selectOption(value, { timeout: 10000 });
+            } catch (error) {
+                console.error(`[Muse] 选择 ${key}=${value} 失败: ${error.message}`);
+                return false;
+            }
+        }
+        const after = await frame.evaluate(() => {
+            const pick = (name) => Array.from(document.querySelectorAll('select'))
+                .find((el) => String(el.autocomplete || '').toLowerCase() === name);
+            const month = pick('bday-month');
+            const day = pick('bday-day');
+            const year = pick('bday-year');
+            return month && day && year ? `${month.value}/${day.value}/${year.value}` : '';
+        }).catch(() => '');
+        console.log(`[Muse] 生日已选 ${birthday.year}-${birthday.month}-${birthday.day}（${birthday.source}）选中后=${after || '<未知>'}`);
+        markProgress(96);
+
+        const submit = frame.locator('[data-muse-bday="submit"]').first();
+        try {
+            if (await submit.count()) {
+                await submit.click({ timeout: 15000 });
+            } else {
+                console.log('[Muse] 没找到可用的提交按钮，改用回车');
+                await frame.locator('[data-muse-bday="year"]').first().press('Enter');
+            }
+        } catch (error) {
+            console.error(`[Muse] 生日提交失败: ${error.message}`);
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 async function dumpExtraPages(context, page, prefix) {
     const others = context.pages().filter((item) => item !== page);
     for (let i = 0; i < others.length; i += 1) {
@@ -821,6 +994,19 @@ function attachNetworkLog(context) {
                 status: response.status(),
                 url: sanitizeUrl(rawUrl)
             });
+            // 注册链路上的报错全靠这个，否则 403 只能看到状态码。
+            if (response.status() >= 400 && /\/api\/auth\/native\//i.test(rawUrl)) {
+                response.text().then((body) => {
+                    write({
+                        at: new Date().toISOString(),
+                        method: request.method(),
+                        type,
+                        status: response.status(),
+                        url: sanitizeUrl(rawUrl),
+                        body: truncate(body, 2000)
+                    });
+                }).catch(() => {});
+            }
         } catch (_) {
             // 忽略无法读取的响应。
         }
@@ -1031,6 +1217,17 @@ async function run() {
                                 await dumpPage(page, '06-after-otp');
                                 markProgress(94);
                                 await dumpExtraPages(context, page, '06-after-otp-page');
+
+                                await dismissDialog(page);
+                                const birthday = resolveBirthday();
+                                if (await fillBirthdayAndSubmit(page, birthday)) {
+                                    await settleAfterAction(page);
+                                    await dumpPage(page, '07-after-birthday');
+                                    markProgress(98);
+                                    await dumpExtraPages(context, page, '07-after-birthday-page');
+                                } else {
+                                    console.log('[Muse] 这一屏没有 bday-* 生日下拉，侦察到此为止。');
+                                }
                             }
                         }
                     }
@@ -1053,7 +1250,7 @@ async function run() {
         if (CONFIG.keepOpen && context) {
             await waitForEnter('[Muse] 浏览器保持打开，按 Enter 关闭... ');
         }
-        markProgress(95);
+        markProgress(99);
         await finalizeVideo(context);
         if (session && session.browser) await session.browser.close().catch(() => {});
         if (networkLog) networkLog.close();

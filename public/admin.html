@@ -2724,6 +2724,10 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                         <label style="margin-bottom: 6px;">邮箱 / 手机号（留空=只侦察首屏）</label>
                         <input type="text" id="muse_account_input" class="asset-input" placeholder="someone@example.com" autocomplete="off">
                     </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label style="margin-bottom: 6px;">生日（留空=随机 22~32 岁）</label>
+                        <input type="text" id="muse_birthday_input" class="asset-input" placeholder="1998-05-12" autocomplete="off">
+                    </div>
                 </div>
                 <div style="display: flex; gap: 20px; margin-top: 14px; flex-wrap: wrap; font-size: 13px;">
                     <label style="display: flex; align-items: center; gap: 6px;">
@@ -8301,6 +8305,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             const url = document.getElementById('muse_url_input')?.value?.trim() || 'https://muse.ai/';
             const proxy = document.getElementById('muse_proxy_input')?.value?.trim() || '';
             const account = document.getElementById('muse_account_input')?.value?.trim() || '';
+            const birthday = document.getElementById('muse_birthday_input')?.value?.trim() || '';
             const clickSignup = Boolean(document.getElementById('muse_click_signup')?.checked);
             const networkLog = Boolean(document.getElementById('muse_network_log')?.checked);
             const video = Boolean(document.getElementById('muse_record_video')?.checked);
@@ -8320,6 +8325,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                     body: JSON.stringify({
                         url,
                         account,
+                        birthday,
                         proxy,
                         click_signup: clickSignup,
                         network_log: networkLog,

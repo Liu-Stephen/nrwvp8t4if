@@ -2735,6 +2735,10 @@ app.post('/api/admin/muse/start', async (req, res) => {
         const video = body.video !== false;
         const proxy = String(body.proxy || '').trim();
         const account = String(body.account || '').replace(/\s/g, '').slice(0, 320);
+        const birthday = String(body.birthday || '').trim().slice(0, 32);
+        if (birthday && !/^\d{4}-\d{2}-\d{2}$/.test(birthday)) {
+            return res.status(400).json({ success: false, error: '生日格式应为 YYYY-MM-DD，留空则随机 22~32 岁' });
+        }
 
         const task = await store.createTaskLog({
             tokenPreview: 'muse.ai',
@@ -2750,8 +2754,8 @@ app.post('/api/admin/muse/start', async (req, res) => {
             message: 'Muse 侦察启动中...',
             progress: 1
         });
-        logTask(task.jobKey, `Muse 注册调试任务已创建 url=${url} proxy=${proxy ? 'yes' : 'no'} video=${video ? 'yes' : 'no'} account=${account ? 'yes' : 'no'}`);
-        spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, video, proxy });
+        logTask(task.jobKey, `Muse 注册调试任务已创建 url=${url} proxy=${proxy ? 'yes' : 'no'} video=${video ? 'yes' : 'no'} account=${account ? 'yes' : 'no'} birthday=${birthday || '<random>'}`);
+        spawnMuseDebugWorker({ task, url, account, birthday, clickSignup, networkLog, video, proxy });
 
         return res.json({ success: true, jobKey: task.jobKey });
     } catch (error) {
@@ -2813,7 +2817,7 @@ app.post('/api/admin/muse/input/:jobKey', async (req, res) => {
     }
 });
 
-function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, video, proxy }) {
+function spawnMuseDebugWorker({ task, url, account, birthday, clickSignup, networkLog, video, proxy }) {
     (async () => {
         const scriptPath = path.join(__dirname, 'muse-register.js');
         try {
@@ -2821,6 +2825,7 @@ function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, vid
                 ...process.env,
                 MUSE_URL: url,
                 MUSE_ACCOUNT: account,
+                MUSE_BIRTHDAY: birthday,
                 MUSE_HEADFUL: '0',
                 MUSE_KEEP_OPEN: '0',
                 MUSE_CLICK_SIGNUP: clickSignup ? '1' : '0',
