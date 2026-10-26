@@ -198,6 +198,10 @@ function maskAccount(value) {
     return `${text.slice(0, 3)}***${text.slice(-2)}`;
 }
 
+function maskEmails(value) {
+    return String(value || '').replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, (match) => maskAccount(match));
+}
+
 // 生日留空时随机取 22~32 岁；日只到 28，避免造出非法日期。
 function resolveBirthday() {
     const raw = CONFIG.birthday;
@@ -1046,7 +1050,18 @@ async function fillBirthdayAndSubmit(page, birthday) {
             try {
                 const select = frame.locator(`[data-muse-bday="${key}"]`).first();
                 await select.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-                await select.selectOption(value, { timeout: 10000 });
+                // 只改 DOM 的 value，React 的 value tracker 会认为值没变、onChange 不跑，
+                // 提交时拿到的还是 state 里的默认值。用原生 setter 绕过它自己的描述符再派发事件。
+                const changed = await select.evaluate((el, next) => {
+                    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+                    setter.call(el, next);
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return String(el.value || '');
+                }, value);
+                if (changed !== value) {
+                    throw new Error(`回读=${changed || '<空>'}`);
+                }
                 await humanPause(page, 260, 900);
             } catch (error) {
                 console.error(`[Muse] 选择 ${key}=${value} 失败: ${error.message}`);
@@ -1056,32 +1071,54 @@ async function fillBirthdayAndSubmit(page, birthday) {
         const after = await frame.evaluate(() => {
             const pick = (name) => Array.from(document.querySelectorAll('select'))
                 .find((el) => String(el.autocomplete || '').toLowerCase() === name);
+            // 页面上那三个自定义按钮（October/26/2026）的文案是 state 渲染出来的，
+            // select.value 只能证明 DOM，这一行才能证明 onChange 真的跑进了 state。
+            const display = (el) => {
+                if (!el) return '?';
+                const names = Array.from(el.options).map((o) => String(o.textContent || '').trim());
+                let node = el.parentElement;
+                for (let depth = 0; node && depth < 4; depth += 1) {
+                    const btn = Array.from(node.querySelectorAll('button'))
+                        .find((b) => names.includes(String(b.textContent || '').trim()));
+                    if (btn) return String(btn.textContent || '').trim();
+                    node = node.parentElement;
+                }
+                return '<没找到触发按钮>';
+            };
             const month = pick('bday-month');
             const day = pick('bday-day');
             const year = pick('bday-year');
-            return month && day && year ? `${month.value}/${day.value}/${year.value}` : '';
+            if (!month || !day || !year) return '';
+            return `${month.value}/${day.value}/${year.value} 显示=${display(month)}/${display(day)}/${display(year)}`;
         }).catch(() => '');
         console.log(`[Muse] 生日已选 ${birthday.year}-${birthday.month}-${birthday.day}（${birthday.source}）选中后=${after || '<未知>'}`);
         markProgress(96);
 
         const submit = frame.locator('[data-muse-bday="submit"]').first();
         try {
-            if (await submit.count()) {
-                await humanPause(page, 700, 2000);
+            if (!(await submit.count())) {
+                console.log('[Muse] 生日屏没有提交按钮，保留现场不回车。');
+                return true;
+            }
+            await humanPause(page, 700, 2000);
+            if (await humanClick(page, submit)) {
+                return true;
+            }
+            // 点到这一步失败基本都是 403 弹框（fixed w-full）盖住了按钮，关掉非导航的那层再点一次。
+            console.log('[Muse] 生日提交第一次没点到，先看是不是被弹框盖住');
+            if (await dismissDialog(page)) {
+                await humanPause(page, 400, 1200);
                 if (await humanClick(page, submit)) {
                     return true;
                 }
-                console.log('[Muse] 生日提交按钮没点到，改用回车');
-                await frame.locator('[data-muse-bday="year"]').first().press('Enter').catch(() => {});
-                return true;
             }
-            console.log('[Muse] 没找到可用的提交按钮，改用回车');
-            await frame.locator('[data-muse-bday="year"]').first().press('Enter');
+            // 这里绝不能用回车兜底：实测回车发出的是 restart 201，整屏会被换回首页。
+            console.log('[Muse] 生日提交按钮仍然点不到，保留现场，不回车。');
+            return true;
         } catch (error) {
             console.error(`[Muse] 生日提交失败: ${error.message}`);
             return false;
         }
-        return true;
     }
     return false;
 }
@@ -1115,6 +1152,25 @@ function attachNetworkLog(context) {
             // 关闭阶段忽略写入错误。
         }
     };
+
+    // 生日到底以什么字段发出去我们从来没见过，请求体先存一份（邮箱打码）。
+    context.on('request', (request) => {
+        try {
+            const rawUrl = request.url();
+            if (!/\/api\/auth\/native\/(register-completion|confirm-otp)/i.test(rawUrl)) return;
+            const body = request.postData();
+            if (!body) return;
+            write({
+                at: new Date().toISOString(),
+                kind: 'request',
+                method: request.method(),
+                url: sanitizeUrl(rawUrl),
+                postData: truncate(maskEmails(body), 2000)
+            });
+        } catch (_) {
+            // 二进制请求体读不出来，跳过。
+        }
+    });
 
     context.on('response', (response) => {
         try {
