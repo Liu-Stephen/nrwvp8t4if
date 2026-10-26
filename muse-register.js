@@ -47,7 +47,8 @@ const CONFIG = {
     chromiumChannel: String(process.env.MUSE_CHROMIUM_CHANNEL || '').trim(),
     cdpPort: String(process.env.MUSE_CDP_PORT || '9333').trim(),
     navigationTimeoutMs: Number(process.env.MUSE_NAV_TIMEOUT_MS || 90000),
-    settleMs: Number(process.env.MUSE_SETTLE_MS || 3000)
+    settleMs: Number(process.env.MUSE_SETTLE_MS || 3000),
+    otpTimeoutMs: Number(process.env.MUSE_OTP_TIMEOUT_MS || 300000)
 };
 
 const RUN_DIR = path.join(CONFIG.debugRoot, stamp());
@@ -332,6 +333,66 @@ function tagAuthFields() {
     return info;
 }
 
+// 在页面上下文中执行：标记验证码输入框（Muse 用的是 sr-only 单框 + 6 个装饰格子）及其提交按钮。
+function tagOtpFields() {
+    const isVisible = (el) => {
+        try {
+            const style = window.getComputedStyle(el);
+            if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+                return false;
+            }
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        } catch (_) {
+            return false;
+        }
+    };
+    const clean = (value, max = 120) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+    const attr = (el, name) => String(el.getAttribute(name) || '');
+
+    const matches = (el) => {
+        if (String(el.autocomplete || '').toLowerCase() === 'one-time-code') return true;
+        const maxLength = Number(el.getAttribute('maxlength') || 0);
+        const hint = [el.name, el.id, el.placeholder, el.getAttribute('aria-label'), el.autocomplete]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+        return maxLength >= 4 && maxLength <= 8 && /(code|otp|pin|verif)/.test(hint);
+    };
+
+    const input = Array.from(document.querySelectorAll('input')).find(matches);
+    if (!input) return null;
+
+    input.setAttribute('data-muse-otp', 'input');
+    const info = {
+        type: attr(input, 'type'),
+        inputMode: attr(input, 'inputmode'),
+        maxLength: attr(input, 'maxlength'),
+        autocomplete: clean(input.autocomplete, 60),
+        ariaLabel: clean(input.getAttribute('aria-label'), 60),
+        hidden: !isVisible(input),
+        boxes: document.querySelectorAll('[data-slot="pin-digit"]').length,
+        submit: null
+    };
+
+    const scope = input.closest('form') || document;
+    const submit = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"], button, [role="button"]')).find((el) => {
+        if (!isVisible(el) || el === input) return false;
+        if (String(el.type || '').toLowerCase() === 'submit') return true;
+        return /confirm|submit|verify|next/i.test(clean(el.innerText || el.value || el.textContent, 60));
+    });
+
+    if (submit) {
+        submit.setAttribute('data-muse-otp', 'submit');
+        info.submit = {
+            tag: String(submit.tagName || '').toLowerCase(),
+            type: attr(submit, 'type'),
+            text: clean(submit.innerText || submit.value || submit.textContent, 60)
+        };
+    }
+    return info;
+}
+
 async function collectPageSummary(page) {
     const frames = [];
     const pageFrames = page.frames();
@@ -597,6 +658,138 @@ async function fillAuthInputAndSubmit(page, account) {
     return false;
 }
 
+async function findOtpField(page) {
+    const pageFrames = page.frames();
+    for (let i = 0; i < pageFrames.length; i += 1) {
+        try {
+            const info = await pageFrames[i].evaluate(tagOtpFields);
+            if (info) {
+                return { frameIndex: i, info };
+            }
+        } catch (_) {
+            // 跨域或已销毁的 frame，跳过。
+        }
+    }
+    return null;
+}
+
+function formatOtpTarget(info) {
+    const parts = [];
+    if (info.type) parts.push(`type=${info.type}`);
+    if (info.inputMode) parts.push(`inputmode=${info.inputMode}`);
+    if (info.maxLength) parts.push(`maxlength=${info.maxLength}`);
+    if (info.autocomplete) parts.push(`ac="${info.autocomplete}"`);
+    if (info.ariaLabel) parts.push(`aria="${truncate(info.ariaLabel, 60)}"`);
+    parts.push(`格子=${info.boxes}`);
+    parts.push(info.hidden ? '输入框=sr-only' : '输入框=可见');
+    parts.push(info.submit ? `按钮="${truncate(info.submit.text, 40)}"` : '按钮=<无 submit，改用回车>');
+    return parts.join(' ');
+}
+
+// 等后台把验证码写进子进程 stdin。等待期间持续打印，避免被父进程的无输出超时杀掉。
+function waitForInputCode(timeoutMs) {
+    console.log('MUSE_INPUT_REQUIRED: otp');
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({ input: process.stdin });
+        const deadline = Date.now() + timeoutMs;
+        let done = false;
+
+        const finish = (value, reason) => {
+            if (done) return;
+            done = true;
+            clearInterval(heartbeat);
+            clearTimeout(timer);
+            rl.close();
+            // 不放开 stdin 的话，子进程会因为一直挂着读端而不退出。
+            process.stdin.pause();
+            if (typeof process.stdin.unref === 'function') {
+                process.stdin.unref();
+            }
+            if (!value) {
+                console.log(`[Muse] 未取得验证码（${reason}）`);
+            }
+            resolve(value);
+        };
+
+        const heartbeat = setInterval(() => {
+            const left = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+            console.log(`[Muse] 等待后台填入验证码... 剩余 ${left}s`);
+        }, 20000);
+
+        const timer = setTimeout(() => finish('', `超时 ${Math.round(timeoutMs / 1000)}s`), timeoutMs);
+
+        rl.on('line', (line) => {
+            const digits = String(line).replace(/\D/g, '').slice(0, 8);
+            if (!digits) {
+                console.log('[Muse] 忽略空/非数字输入');
+                return;
+            }
+            console.log(`[Muse] 收到验证码 digits=${digits.length}`);
+            finish(digits, '');
+        });
+        rl.on('close', () => finish('', 'stdin 已关闭'));
+    });
+}
+
+async function fillOtpAndSubmit(page, code) {
+    const pageFrames = page.frames();
+    for (let i = 0; i < pageFrames.length; i += 1) {
+        const frame = pageFrames[i];
+        let info = null;
+        try {
+            info = await frame.evaluate(tagOtpFields);
+        } catch (_) {
+            continue;
+        }
+        if (!info) continue;
+
+        const input = frame.locator('[data-muse-otp="input"]').first();
+        console.log(`[Muse] 填写验证码 frame#${i} ${formatOtpTarget(info)}`);
+        await input.fill(code, { timeout: 10000 }).catch((error) => {
+            console.error(`[Muse] 验证码 fill 失败: ${error.message}`);
+        });
+
+        const value = await input.evaluate((el) => String(el.value || '')).catch(() => '');
+        if (value.length !== code.length) {
+            // 装饰格子由 React state 驱动，fill 没生效时退回逐字符敲键。
+            console.log(`[Muse] fill 后读到 ${value.length} 位，改用逐字符输入`);
+            await input.evaluate((el) => {
+                el.value = '';
+                el.focus();
+            }).catch(() => {});
+            await page.keyboard.type(code, { delay: 80 }).catch(() => {});
+        }
+        markProgress(90);
+
+        const submit = frame.locator('[data-muse-otp="submit"]').first();
+        try {
+            if (await submit.count()) {
+                await submit.click({ timeout: 15000 });
+            } else {
+                await input.press('Enter');
+            }
+        } catch (error) {
+            console.error(`[Muse] 提交按钮点击失败，改用回车: ${error.message}`);
+            await input.press('Enter').catch(() => {});
+        }
+        return true;
+    }
+    return false;
+}
+
+async function dumpExtraPages(context, page, prefix) {
+    const others = context.pages().filter((item) => item !== page);
+    for (let i = 0; i < others.length; i += 1) {
+        await dumpPage(others[i], `${prefix}-${i + 1}`).catch(() => {});
+    }
+}
+
+async function settleAfterAction(page) {
+    await page.waitForTimeout(CONFIG.settleMs);
+    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+}
+
 function attachNetworkLog(context) {
     if (!CONFIG.networkLog) {
         return { file: '', close: () => {} };
@@ -820,17 +1013,26 @@ async function run() {
                 if (await awaitAuthInput(page)) {
                     const submitted = await fillAuthInputAndSubmit(page, CONFIG.account);
                     if (submitted) {
-                        await page.waitForTimeout(CONFIG.settleMs);
-                        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-                        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+                        await settleAfterAction(page);
                         await dumpPage(page, '05-after-continue');
                         markProgress(82);
+                        await dumpExtraPages(context, page, '05-after-continue-page');
+                        markProgress(84);
 
-                        const others = context.pages().filter((item) => item !== page);
-                        for (let i = 0; i < others.length; i += 1) {
-                            await dumpPage(others[i], `06-after-continue-page-${i + 1}`).catch(() => {});
+                        const otpField = await findOtpField(page);
+                        if (!otpField) {
+                            console.log('[Muse] 第二屏没找到验证码输入框，侦察到此为止。');
+                        } else {
+                            console.log(`[Muse] 第二屏 ${formatOtpTarget(otpField.info)}`);
+                            markProgress(86);
+                            const code = await waitForInputCode(CONFIG.otpTimeoutMs);
+                            if (code && await fillOtpAndSubmit(page, code)) {
+                                await settleAfterAction(page);
+                                await dumpPage(page, '06-after-otp');
+                                markProgress(94);
+                                await dumpExtraPages(context, page, '06-after-otp-page');
+                            }
                         }
-                        markProgress(90);
                     }
                 } else {
                     console.log('[Muse] 没有等到邮箱/手机号输入框，跳过填写步骤。');

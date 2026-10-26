@@ -2752,6 +2752,13 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                 <h2 class="panel-title">任务状态</h2>
                 <div id="muse_result_status" style="font-weight: 600; margin-top: 12px; margin-bottom: 8px;"></div>
                 <div id="muse_result_message" style="font-size: 13px; color: var(--text-dim); margin-bottom: 12px;"></div>
+                <div id="muse_otp_wrap" style="display: none; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;">
+                    <input type="text" id="muse_otp_input" class="asset-input" inputmode="numeric" maxlength="8" placeholder="6 位验证码" autocomplete="off" style="width: 160px;">
+                    <button type="button" class="btn btn-primary" onclick="submitMuseOtp()" id="muse_otp_btn">
+                        <i data-lucide="send"></i> 提交验证码
+                    </button>
+                    <span style="font-size: 12px; color: var(--text-dim);">脚本最多等 5 分钟，超时则本次侦察结束</span>
+                </div>
                 <div id="muse_video_wrap" style="margin-bottom: 12px;"></div>
                 <div id="muse_screenshot_wrap"></div>
             </div>
@@ -8057,6 +8064,10 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             if (videoWrap) videoWrap.innerHTML = '';
             const hint = document.getElementById('muse_job_hint');
             if (hint) hint.textContent = '';
+            const otpWrap = document.getElementById('muse_otp_wrap');
+            if (otpWrap) otpWrap.style.display = 'none';
+            const otpInput = document.getElementById('muse_otp_input');
+            if (otpInput) otpInput.value = '';
         }
 
         function appendMuseDebugLogEntries(entries) {
@@ -8174,6 +8185,9 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                 } else if (status === 'running') {
                     statusEl.textContent = `⏳ Muse 侦察进行中... ${progress}%`;
                     statusEl.style.color = 'var(--text-dim)';
+                } else if (status === 'manual') {
+                    statusEl.textContent = '✍️ 等待人工输入验证码';
+                    statusEl.style.color = '#f59e0b';
                 } else {
                     statusEl.textContent = '❌ Muse 侦察失败';
                     statusEl.style.color = 'var(--error, #ef4444)';
@@ -8181,6 +8195,10 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
             }
             if (messageEl) {
                 messageEl.textContent = data.message || '';
+            }
+            const otpWrap = document.getElementById('muse_otp_wrap');
+            if (otpWrap) {
+                otpWrap.style.display = (status === 'manual' && museDebugJobKey) ? 'flex' : 'none';
             }
 
             const shots = Array.isArray(data.screenshots) ? data.screenshots : [];
@@ -8237,6 +8255,40 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                     }
                 }
             } catch (_) { /* ignore */ }
+        }
+
+        async function submitMuseOtp() {
+            if (!museDebugJobKey) {
+                showMessage('没有正在等待验证码的任务', 'warning');
+                return;
+            }
+            const input = document.getElementById('muse_otp_input');
+            const code = String(input?.value || '').replace(/\D/g, '');
+            if (code.length < 4) {
+                showMessage('验证码至少 4 位数字', 'error');
+                return;
+            }
+            const btn = document.getElementById('muse_otp_btn');
+            if (btn) btn.disabled = true;
+            try {
+                const res = await authFetch(`/api/admin/muse/input/${encodeURIComponent(museDebugJobKey)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                const data = await res.json();
+                if (!res.ok || !data.success) {
+                    throw new Error(data.error || data.message || '提交失败');
+                }
+                showMessage('验证码已下发给脚本', 'success');
+                if (input) input.value = '';
+                const wrap = document.getElementById('muse_otp_wrap');
+                if (wrap) wrap.style.display = 'none';
+            } catch (e) {
+                showMessage(e.message || '提交失败', 'error');
+            } finally {
+                if (btn) btn.disabled = false;
+            }
         }
 
         async function startMuseDebug() {

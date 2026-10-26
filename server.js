@@ -1134,13 +1134,16 @@ function normalizeTaskProgress(progress, status = 'running', previous = 0) {
     return Math.max(Math.max(0, Number(previous) || 0), cappedProgress);
 }
 
-function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = null) {
+function runCheckoutScript(jobKey, scriptPath, env, attempt = 1, onProgress = null, onSpawned = null) {
     return new Promise((resolve) => {
         logTask(jobKey, `启动子进程 attempt=${attempt} script=${scriptPath}`);
         const child = spawn('node', [scriptPath], {
             env,
             windowsHide: true
         });
+        if (onSpawned) {
+            onSpawned(child);
+        }
 
         let output = '';
         let idleTimer = null;
@@ -2678,6 +2681,7 @@ app.get('/api/admin/checkout/status/:jobKey', async (req, res) => {
 // ─── Muse 注册调试 API ────────────────────────────────────────────────────
 
 const MUSE_DEBUG_CDK = '[muse-debug]';
+const museDebugChildren = new Map();
 
 function parseMuseProgress(output) {
     const matches = String(output || '').match(/MUSE_PROGRESS:\s*(\d{1,3})/g);
@@ -2781,6 +2785,28 @@ app.get('/api/admin/muse/status/:jobKey', async (req, res) => {
     }
 });
 
+app.post('/api/admin/muse/input/:jobKey', async (req, res) => {
+    try {
+        const jobKey = decodeURIComponent(String(req.params.jobKey || '').trim());
+        const code = String((req.body || {}).code || '').replace(/\D/g, '').slice(0, 8);
+        if (!jobKey) {
+            return res.status(400).json({ success: false, error: '缺少 jobKey' });
+        }
+        if (code.length < 4) {
+            return res.status(400).json({ success: false, error: '验证码至少 4 位数字' });
+        }
+        const child = museDebugChildren.get(jobKey);
+        if (!child || !child.stdin || child.stdin.destroyed) {
+            return res.status(404).json({ success: false, error: '该任务没有在等输入（进程已结束或未到验证码步骤）' });
+        }
+        child.stdin.write(`${code}\n`);
+        logTask(jobKey, `已下发验证码 digits=${code.length} 给子进程`);
+        return res.json({ success: true, digits: code.length });
+    } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, video, proxy }) {
     (async () => {
         const scriptPath = path.join(__dirname, 'muse-register.js');
@@ -2799,7 +2825,17 @@ function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, vid
             };
 
             let lastProgress = 1;
+            let otpRequested = false;
             const run = await runCheckoutScript(task.jobKey, scriptPath, runtimeEnv, 1, async (_progress, output) => {
+                if (!otpRequested && /MUSE_INPUT_REQUIRED:\s*otp/.test(output)) {
+                    otpRequested = true;
+                    await store.updateTaskLog(task.jobKey, {
+                        status: 'manual',
+                        message: '验证码已发送，请在下方填入 6 位验证码',
+                        progress: lastProgress
+                    });
+                    logTask(task.jobKey, '第二屏已出现验证码输入框，等待后台人工填入');
+                }
                 const next = parseMuseProgress(output);
                 if (next > lastProgress) {
                     lastProgress = next;
@@ -2809,6 +2845,8 @@ function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, vid
                         progress: next
                     });
                 }
+            }, (child) => {
+                museDebugChildren.set(task.jobKey, child);
             });
 
             const media = extractTaskMediaFromOutput(run.output);
@@ -2834,6 +2872,8 @@ function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, vid
                 message: error.message,
                 progress: 1
             });
+        } finally {
+            museDebugChildren.delete(task.jobKey);
         }
     })();
 }
