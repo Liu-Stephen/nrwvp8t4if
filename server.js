@@ -2730,6 +2730,7 @@ app.post('/api/admin/muse/start', async (req, res) => {
         const networkLog = body.network_log !== false;
         const video = body.video !== false;
         const proxy = String(body.proxy || '').trim();
+        const account = String(body.account || '').replace(/\s/g, '').slice(0, 320);
 
         const task = await store.createTaskLog({
             tokenPreview: 'muse.ai',
@@ -2745,8 +2746,8 @@ app.post('/api/admin/muse/start', async (req, res) => {
             message: 'Muse 侦察启动中...',
             progress: 1
         });
-        logTask(task.jobKey, `Muse 注册调试任务已创建 url=${url} proxy=${proxy ? 'yes' : 'no'} video=${video ? 'yes' : 'no'}`);
-        spawnMuseDebugWorker({ task, url, clickSignup, networkLog, video, proxy });
+        logTask(task.jobKey, `Muse 注册调试任务已创建 url=${url} proxy=${proxy ? 'yes' : 'no'} video=${video ? 'yes' : 'no'} account=${account ? 'yes' : 'no'}`);
+        spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, video, proxy });
 
         return res.json({ success: true, jobKey: task.jobKey });
     } catch (error) {
@@ -2780,13 +2781,14 @@ app.get('/api/admin/muse/status/:jobKey', async (req, res) => {
     }
 });
 
-function spawnMuseDebugWorker({ task, url, clickSignup, networkLog, video, proxy }) {
+function spawnMuseDebugWorker({ task, url, account, clickSignup, networkLog, video, proxy }) {
     (async () => {
         const scriptPath = path.join(__dirname, 'muse-register.js');
         try {
             const runtimeEnv = {
                 ...process.env,
                 MUSE_URL: url,
+                MUSE_ACCOUNT: account,
                 MUSE_HEADFUL: '0',
                 MUSE_KEEP_OPEN: '0',
                 MUSE_CLICK_SIGNUP: clickSignup ? '1' : '0',

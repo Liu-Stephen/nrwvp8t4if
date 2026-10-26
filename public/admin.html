@@ -2706,7 +2706,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
         <div id="muse_debug" class="page-view">
             <div class="page-header">
                 <h1>Muse 注册调试</h1>
-                <p>在服务器上启动 Playwright 打开 muse.ai，自动点击注册/登录入口并导出页面结构、步骤截图与全程录像（当前版本不填邮箱、不提交验证码）</p>
+                <p>在服务器上启动 Playwright 打开 muse.ai，自动点击注册/登录入口并导出页面结构、步骤截图与全程录像。填了邮箱/手机号会继续提交一次、侦察第二屏；验证码仍需人工，本版不处理</p>
             </div>
 
             <div class="panel">
@@ -2719,6 +2719,10 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                     <div class="form-group" style="margin-bottom: 0;">
                         <label style="margin-bottom: 6px;">代理（留空直连）</label>
                         <input type="text" id="muse_proxy_input" class="asset-input" placeholder="http://user:pass@host:port" autocomplete="off">
+                    </div>
+                    <div class="form-group" style="margin-bottom: 0;">
+                        <label style="margin-bottom: 6px;">邮箱 / 手机号（留空=只侦察首屏）</label>
+                        <input type="text" id="muse_account_input" class="asset-input" placeholder="someone@example.com" autocomplete="off">
                     </div>
                 </div>
                 <div style="display: flex; gap: 20px; margin-top: 14px; flex-wrap: wrap; font-size: 13px;">
@@ -8238,6 +8242,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
         async function startMuseDebug() {
             const url = document.getElementById('muse_url_input')?.value?.trim() || 'https://muse.ai/';
             const proxy = document.getElementById('muse_proxy_input')?.value?.trim() || '';
+            const account = document.getElementById('muse_account_input')?.value?.trim() || '';
             const clickSignup = Boolean(document.getElementById('muse_click_signup')?.checked);
             const networkLog = Boolean(document.getElementById('muse_network_log')?.checked);
             const video = Boolean(document.getElementById('muse_record_video')?.checked);
@@ -8256,6 +8261,7 @@ http://USER-session-{session}:PASS@proxy.example.com:1000"></textarea>
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         url,
+                        account,
                         proxy,
                         click_signup: clickSignup,
                         network_log: networkLog,

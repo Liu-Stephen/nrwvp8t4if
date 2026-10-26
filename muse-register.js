@@ -43,6 +43,7 @@ const CONFIG = {
     video: String(process.env.MUSE_VIDEO || '1') !== '0',
     videoDir: path.resolve(process.env.MUSE_VIDEO_DIR || path.join(__dirname, 'debug_screenshots', 'videos')),
     proxy: String(process.env.MUSE_PROXY || '').trim(),
+    account: String(process.env.MUSE_ACCOUNT || '').trim().slice(0, 320),
     chromiumChannel: String(process.env.MUSE_CHROMIUM_CHANNEL || '').trim(),
     cdpPort: String(process.env.MUSE_CDP_PORT || '9333').trim(),
     navigationTimeoutMs: Number(process.env.MUSE_NAV_TIMEOUT_MS || 90000),
@@ -78,10 +79,21 @@ function truncate(value, max = 1200) {
 function formatInput(input) {
     const parts = [`type=${input.type || '?'}`];
     if (input.name) parts.push(`name=${input.name}`);
+    if (input.inputMode) parts.push(`inputmode=${input.inputMode}`);
     if (input.placeholder) parts.push(`placeholder="${truncate(input.placeholder, 60)}"`);
     if (input.ariaLabel) parts.push(`aria="${truncate(input.ariaLabel, 60)}"`);
     parts.push(`visible=${input.visible ? 'yes' : 'no'}`);
     return `{ ${parts.join(' ')} }`;
+}
+
+function maskAccount(value) {
+    const text = String(value || '').trim();
+    if (!text) return '';
+    if (text.includes('@')) {
+        const [local, domain] = text.split('@');
+        return `${local.slice(0, 2)}***@${domain}`;
+    }
+    return `${text.slice(0, 3)}***${text.slice(-2)}`;
 }
 
 function formatButton(button) {
@@ -135,6 +147,7 @@ function collectFrameDom() {
             placeholder: attr(el, 'placeholder'),
             ariaLabel: attr(el, 'aria-label') || attr(el, 'aria-labelledby'),
             autocomplete: attr(el, 'autocomplete'),
+            inputMode: attr(el, 'inputmode'),
             role: attr(el, 'role'),
             text: textOf(el),
             href: el.href ? String(el.href) : '',
@@ -256,6 +269,67 @@ function detectAuthInput() {
             .toLowerCase();
         return type === 'email' || type === 'tel' || /email|phone|mobile/.test(hint);
     });
+}
+
+// 在页面上下文中执行：标记首个可见的邮箱/手机号输入框及其提交按钮。
+function tagAuthFields() {
+    const isVisible = (el) => {
+        try {
+            const style = window.getComputedStyle(el);
+            if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) {
+                return false;
+            }
+            const rect = el.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        } catch (_) {
+            return false;
+        }
+    };
+    const clean = (value, max = 120) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
+    const attr = (el, name) => String(el.getAttribute(name) || '');
+
+    const matches = (el) => {
+        const type = String(el.type || '').toLowerCase();
+        const hint = [el.name, el.id, el.placeholder, el.getAttribute('aria-label'), el.autocomplete]
+            .filter(Boolean)
+            .join(' ')
+            .toLowerCase();
+        return type === 'email' || type === 'tel' || /email|phone|mobile/.test(hint);
+    };
+
+    const input = Array.from(document.querySelectorAll('input')).find((el) => isVisible(el) && matches(el));
+    if (!input) return null;
+
+    input.setAttribute('data-muse-auth', 'input');
+    const info = {
+        type: attr(input, 'type'),
+        name: input.name || '',
+        id: input.id || '',
+        placeholder: clean(input.placeholder, 60),
+        ariaLabel: clean(input.getAttribute('aria-label'), 60),
+        autocomplete: clean(input.autocomplete, 60),
+        inputMode: attr(input, 'inputmode'),
+        dataSlot: attr(input, 'data-slot'),
+        submit: null
+    };
+
+    const scope = input.closest('form') || document;
+    const buttons = Array.from(scope.querySelectorAll('button[type="submit"], input[type="submit"], button, [role="button"]'));
+    const submit = buttons.find((el) => {
+        if (!isVisible(el) || el === input) return false;
+        if (String(el.type || '').toLowerCase() === 'submit') return true;
+        return /continue|next|submit|sign\s*up|log\s*in/i.test(clean(el.innerText || el.value || el.textContent, 60));
+    });
+
+    if (submit) {
+        submit.setAttribute('data-muse-auth', 'submit');
+        info.submit = {
+            tag: String(submit.tagName || '').toLowerCase(),
+            type: attr(submit, 'type'),
+            text: clean(submit.innerText || submit.value || submit.textContent, 60)
+        };
+    }
+    return info;
 }
 
 async function collectPageSummary(page) {
@@ -461,6 +535,68 @@ async function clickCandidate(candidate) {
     await locator.click({ timeout: 15000 });
 }
 
+async function awaitAuthInput(page, timeoutMs = 10000) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+        if (await hasAuthInput(page)) return true;
+        if (Date.now() >= deadline) return false;
+        await page.waitForTimeout(1000);
+    }
+}
+
+function formatAuthTarget(info) {
+    const parts = [];
+    if (info.type) parts.push(`type=${info.type}`);
+    if (info.inputMode) parts.push(`inputmode=${info.inputMode}`);
+    if (info.placeholder) parts.push(`placeholder="${truncate(info.placeholder, 60)}"`);
+    if (info.ariaLabel) parts.push(`aria="${truncate(info.ariaLabel, 60)}"`);
+    if (info.dataSlot) parts.push(`slot=${info.dataSlot}`);
+    parts.push(info.submit ? `按钮="${truncate(info.submit.text, 40)}"` : '按钮=<无 submit，改用回车>');
+    return parts.join(' ');
+}
+
+async function fillAuthInputAndSubmit(page, account) {
+    const pageFrames = page.frames();
+    for (let i = 0; i < pageFrames.length; i += 1) {
+        const frame = pageFrames[i];
+        let info = null;
+        try {
+            info = await frame.evaluate(tagAuthFields);
+        } catch (_) {
+            // 跨域或已销毁的 frame，跳过。
+            continue;
+        }
+        if (!info) continue;
+
+        const input = frame.locator('[data-muse-auth="input"]').first();
+        console.log(`[Muse] 填写邮箱/手机号 frame#${i} ${formatAuthTarget(info)} <- ${maskAccount(account)}`);
+        await input.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+        try {
+            await input.click({ timeout: 10000 });
+            await input.fill(account, { timeout: 10000 });
+        } catch (error) {
+            console.error(`[Muse] 输入框填写失败: ${error.message}`);
+            return false;
+        }
+        markProgress(75);
+
+        const submit = frame.locator('[data-muse-auth="submit"]').first();
+        try {
+            if (await submit.count()) {
+                await submit.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+                await submit.click({ timeout: 15000 });
+            } else {
+                await input.press('Enter');
+            }
+        } catch (error) {
+            console.error(`[Muse] 提交按钮点击失败，改用回车: ${error.message}`);
+            await input.press('Enter').catch(() => {});
+        }
+        return true;
+    }
+    return false;
+}
+
 function attachNetworkLog(context) {
     if (!CONFIG.networkLog) {
         return { file: '', close: () => {} };
@@ -591,7 +727,7 @@ async function run() {
 
     console.log(`[Muse] 侦察开始 url=${CONFIG.url}`);
     console.log(`[Muse] 日志目录 ${RUN_DIR}`);
-    console.log(`[Muse] headful=${CONFIG.headful} proxy=${CONFIG.proxy ? 'yes' : 'no'} clickSignup=${CONFIG.clickSignup}`);
+    console.log(`[Muse] headful=${CONFIG.headful} proxy=${CONFIG.proxy ? 'yes' : 'no'} clickSignup=${CONFIG.clickSignup} account=${CONFIG.account ? maskAccount(CONFIG.account) : '<none>'}`);
 
     const preparedProxy = await preparePlaywrightProxy(CONFIG.proxy);
     let session = null;
@@ -677,6 +813,31 @@ async function run() {
                         await dumpPage(pages[i], `04-extra-page-${i + 1}`).catch(() => {});
                     }
                 }
+            }
+        }
+        if (CONFIG.account) {
+            try {
+                if (await awaitAuthInput(page)) {
+                    const submitted = await fillAuthInputAndSubmit(page, CONFIG.account);
+                    if (submitted) {
+                        await page.waitForTimeout(CONFIG.settleMs);
+                        await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+                        await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+                        await dumpPage(page, '05-after-continue');
+                        markProgress(82);
+
+                        const others = context.pages().filter((item) => item !== page);
+                        for (let i = 0; i < others.length; i += 1) {
+                            await dumpPage(others[i], `06-after-continue-page-${i + 1}`).catch(() => {});
+                        }
+                        markProgress(90);
+                    }
+                } else {
+                    console.log('[Muse] 没有等到邮箱/手机号输入框，跳过填写步骤。');
+                }
+            } catch (error) {
+                // 提交后可能正在跳转，这里失败不应丢掉已导出的首屏结果。
+                console.error(`[Muse] 提交后侦察失败: ${error.message}`);
             }
         }
     } catch (error) {
