@@ -114,15 +114,10 @@ async function humanClick(page, locator) {
             return false;
         }
     }
-    try {
-        await locator.click({ timeout: 10000 });
-        return true;
-    } catch (error) {
-        // sr-only 之类的输入框点不到，聚焦后照样能敲键盘。
-        console.log(`[Muse] 点击失败，改用 focus: ${error.message}`);
-        await locator.focus({ timeout: 5000 }).catch(() => {});
-        return false;
-    }
+    // 走到这里说明盒子太小或拿不到：sr-only 输入框是 1×1，硬点会被上层 role="presentation"
+    // 的容器拦住指针，白等 10 秒还会打一大段 Playwright 重试日志。聚焦后照样能敲键盘。
+    await locator.focus({ timeout: 5000 }).catch(() => {});
+    return false;
 }
 
 // 逐字符敲键，敲完回读；没落上就退回 fill，避免为了节奏把表单填空。
@@ -540,18 +535,26 @@ function dismissErrorDialog() {
     };
     const clean = (value, max = 300) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, max);
 
-    const target = Array.from(document.querySelectorAll('button, [role="button"]')).find((el) => {
-        if (!isVisible(el)) return false;
+    const isCloseish = (el) => {
         if (String(el.getAttribute('aria-label') || '').toLowerCase() === 'close') return true;
         return clean(el.innerText || el.value || el.textContent, 20).toLowerCase() === 'ok';
-    });
-    if (!target) return null;
+    };
+    // 「Returning to login」这类按钮的 aria-label 也是 close，点下去等于 POST /api/auth/native/restart，
+    // 当前这一屏（生日下拉）会被整个换掉，所以只能认出来、不能点。
+    const isNavigational = (el) => /return(ing| back)|back to|log ?in|sign ?in/i.test(clean(el.innerText || el.textContent, 40));
 
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter((el) => isVisible(el) && isCloseish(el));
+    if (!buttons.length) return null;
+
+    const target = buttons.find((el) => !isNavigational(el)) || buttons[0];
+    const navigational = isNavigational(target);
+    target.setAttribute('data-muse-dismiss', navigational ? 'nav' : '1');
     const dialog = target.closest('[role="dialog"], [role="alertdialog"]') || target.parentElement;
-    target.setAttribute('data-muse-dismiss', '1');
     return {
         label: clean(target.getAttribute('aria-label') || target.innerText || target.textContent, 30),
-        text: dialog ? clean(dialog.innerText || dialog.textContent) : ''
+        text: dialog ? clean(dialog.innerText || dialog.textContent) : '',
+        button: clean(target.innerText || target.textContent, 40),
+        navigational
     };
 }
 
@@ -953,19 +956,28 @@ async function fillOtpAndSubmit(page, code) {
             console.error(`[Muse] 验证码输入失败: ${error.message}`);
         });
 
+        // 六位一落这个页面会自己提交（confirm-otp 不需要点确认），提交后输入框被清空、整屏换掉，
+        // 所以 el.value 不能当成功信号：只看这一屏还在不在、确认按钮还是不是灰的。
+        if ((await input.count()) === 0) {
+            console.log('[Muse] 验证码已经自动提交，第二屏已经不在了');
+            markProgress(90);
+            return true;
+        }
+        const submit = frame.locator('[data-muse-otp="submit"]').first();
         const value = await input.evaluate((el) => String(el.value || '')).catch(() => '');
-        if (value.length !== code.length) {
-            // 装饰格子由 React state 驱动，前两种写法都没落上时清空再敲一遍。
+        const confirmReady = await submit.isEnabled().catch(() => false);
+        if (value.length !== code.length && !confirmReady) {
+            // 装饰格子由 React state 驱动，确认按钮还是灰的才说明确实没落上。
             console.log(`[Muse] 验证码只落上 ${value.length} 位，清空重敲`);
             await input.evaluate((el) => {
                 el.value = '';
                 el.focus();
             }).catch(() => {});
             await page.keyboard.type(code, { delay: 110 }).catch(() => {});
+        } else if (value.length !== code.length) {
+            console.log('[Muse] 输入框已清空但确认按钮可用，按已提交处理，不重敲废码');
         }
         markProgress(90);
-
-        const submit = frame.locator('[data-muse-otp="submit"]').first();
         try {
             if (await submit.count()) {
                 await humanPause(page, 500, 1500);
@@ -1000,6 +1012,10 @@ async function dismissDialog(page) {
             }
         }
         if (!hit) return false;
+        if (hit.found.navigational) {
+            console.log(`[Muse] 弹框只剩跳转按钮「${hit.found.button}」，点了会重启注册流程，留着不动`);
+            return true;
+        }
         console.log(`[Muse] 关掉弹框 [${hit.found.label}] ${truncate(hit.found.text, 200)}`);
         await humanPause(page, 400, 1300);
         await humanClick(page, hit.frame.locator('[data-muse-dismiss="1"]').first());
@@ -1339,15 +1355,23 @@ async function run() {
                                 markProgress(94);
                                 await dumpExtraPages(context, page, '06-after-otp-page');
 
-                                await dismissDialog(page);
+                                // 这一屏一渲染就拿着默认值（今天，0 岁）自己提交了一次 register-completion，
+                                // 而弹框一点（尤其「Returning to login」）整个流程就 restart、下拉框全消失，
+                                // 所以必须趁表单还活着先把生日选掉，弹框放到之后再处理。
                                 const birthday = resolveBirthday();
-                                if (await fillBirthdayAndSubmit(page, birthday)) {
+                                let birthdayDone = await fillBirthdayAndSubmit(page, birthday);
+                                if (!birthdayDone) {
+                                    console.log('[Muse] 这一屏没有 bday-* 生日下拉，先关弹框再找一次。');
+                                    await dismissDialog(page);
+                                    birthdayDone = await fillBirthdayAndSubmit(page, birthday);
+                                }
+                                if (birthdayDone) {
                                     await settleAfterAction(page);
                                     await dumpPage(page, '07-after-birthday');
                                     markProgress(98);
                                     await dumpExtraPages(context, page, '07-after-birthday-page');
                                 } else {
-                                    console.log('[Muse] 这一屏没有 bday-* 生日下拉，侦察到此为止。');
+                                    console.log('[Muse] 关掉弹框后还是没有生日下拉，侦察到此为止。');
                                 }
                             }
                         }
