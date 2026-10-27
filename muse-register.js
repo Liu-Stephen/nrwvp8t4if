@@ -1365,22 +1365,43 @@ async function run() {
 
                                     // 这一屏有两种落点：新号停在 disclosure（只有 Get started 可点），
                                     // 老号登录直接落 /access/verification 的卡页（025224 就是）。
-                                    // 所以「没有 Get started」不是终点，认出卡页才是要紧的。
+                                    // 但 disclosure 是生日屏自己提交后才异步挂出来的，验证码刚过那一瞬页面还停在
+                                    // 生日屏上（075725：一次性找 Get started 找空，等 cc-number 的 20 秒里 disclosure
+                                    // 才出现，结果按钮没点、卡页也没认出来）。所以两种落点都得轮询，谁先来走谁。
                                     const getStarted = page.locator('button', { hasText: 'Get started' }).first();
-                                    if (await getStarted.count()) {
-                                        if (!await humanClick(page, getStarted)) {
-                                            console.log('[Muse] Get started 没点到，照样往下找卡页。');
+                                    const cardNumber = page.locator('input[autocomplete="cc-number"]').first();
+                                    // 一律按「可见」判定，不能只看节点在不在：disclosure 刚挂出来那一拍，<button>
+                                    // 已进文档但还没布局，count() 说有、humanClick 拿不到盒子就白点一次（一次机会
+                                    // 用光，剩下 60 秒干等）。卡号框同理，旧代码 waitForSelector 等的就是可见。
+                                    const isShown = (locator) => locator.isVisible().catch(() => false);
+                                    const deadline = Date.now() + 60000;
+                                    let clickedDisclosure = false;
+                                    while (Date.now() < deadline && !(await isShown(cardNumber))) {
+                                        if (!clickedDisclosure && await isShown(getStarted)) {
+                                            // 只点一次：点了以后 POST /api/hatch/accept-tos 要时间换屏，
+                                            // 对着还留在屏幕上的旧按钮再补一次等于重复提交。
+                                            clickedDisclosure = true;
+                                            console.log(await humanClick(page, getStarted)
+                                                ? '[Muse] 已点 disclosure 的 Get started，等卡页。'
+                                                : '[Muse] Get started 没点到，继续等卡页。');
                                         }
-                                    } else {
-                                        console.log('[Muse] 这一屏没有 Get started，按已经过了 disclosure 处理。');
+                                        await humanPause(page, 800, 1600);
                                     }
-                                    // 结账屏是客户端异步挂起来的，不等一下就等着导出「加载中」那一帧。
-                                    // 四个框齐不齐由 fillCardAndConfirm 自己判，这里只管现场。
-                                    await page.waitForSelector('input[autocomplete="cc-number"]', { timeout: 20000 }).catch(() => {
-                                        console.log('[Muse] 20s 内没等到卡号输入框，照样导出现场。');
-                                    });
-                                    await dumpPage(page, '08-card-page');
-                                    await dumpExtraPages(context, page, '08-card-page');
+                                    const reachedCard = await isShown(cardNumber);
+                                    const cardPageLabel = reachedCard ? '08-card-page' : '08-no-card-page';
+                                    await dumpPage(page, cardPageLabel);
+                                    await dumpExtraPages(context, page, cardPageLabel);
+                                    if (!reachedCard) {
+                                        const url = sanitizeUrl(page.url());
+                                        console.log(clickedDisclosure
+                                            ? `[Muse] 已点 Get started，但 60s 内没等到卡页（url=${url}），跳过绑卡。`
+                                            : `[Muse] 60s 内既没出现 disclosure 的 Get started，也没出现卡页（url=${url}），跳过绑卡。`);
+                                        // 后台按「退出码 0 + MUSE_DEBUG_DONE」判成功（server.js:2875），没到卡页的
+                                        // 上一轮照样报绿。这行前缀是 server.js:697 认的运行时错误标记，为的是让
+                                        // 任务列表直接写清卡在哪一步，不只是「子进程退出 code=1」。
+                                        console.error(`❌ [运行时错误]: ${clickedDisclosure ? '点了 Get started 却没等到卡页' : '没等到 disclosure 的 Get started'}，url=${url}`);
+                                        process.exitCode = 1;
+                                    }
                                     await fillCardAndConfirm(page, context);
                                 }
                             }
