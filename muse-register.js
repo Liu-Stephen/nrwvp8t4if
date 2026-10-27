@@ -3,8 +3,8 @@
 /**
  * muse.ai 注册链路脚本
  *
- * 流程：打开站点 → 填邮箱/手机号 → 等后台人工下发验证码 → 改写 app 自己发出的 register-completion
- * 请求体带上成年生日 → 新号过 disclosure 点 Get started、老号登录后直接落卡页 → 在
+ * 流程：打开站点 → 填邮箱/手机号 → 等后台人工下发验证码 → 填生日屏的姓名并点 Confirm，成年生日靠改写
+ * register-completion 请求体带上 → 新号过 disclosure 点 Get started、老号登录后直接落卡页 → 在
  * /access/verification 用卡池里的真卡确认年龄（$1 押金，5-7 工作日退）。
  * 每一步都导出 json / png / html 到 debug_screenshots/muse-debug/<时间戳>/。
  *
@@ -33,7 +33,7 @@ const { connectStandaloneBrowser } = require('./browser-standalone');
 const { preparePlaywrightProxy } = require('./playwright-proxy');
 const store = require('./mysql-store');
 const { pickBillingAddressForCheckout } = require('./tax-free-address');
-const { normalizeCardNumber, normalizeCardExpiry } = require('./stripe-payment');
+const { normalizeCardNumber, normalizeCardExpiry, generateRandomName } = require('./stripe-payment');
 // 代充那边「只有明确拒付才报废」用的就是这个关键词表，绑卡这边照它对齐，别自己定一套。
 const { isPaymentDeclined } = require('./payment-retry');
 
@@ -957,18 +957,26 @@ async function fillOtpAndSubmit(page, code) {
     return false;
 }
 
-// app 在生日屏一 mount 就拿默认值（今天，0 岁）发一发 register-completion，实测比任何 UI 动作都早
-// （140708：confirm-otp 200 后 2.36 s 发出 {"date_of_birth":"2026-10-26"}，我们 18 s 后才开始碰下拉）。
-// 所以成年生日只能改写它自己那一发的请求体；date_of_birth 是唯一带生日的字段，其余字段原样保留。
+// 生日屏有两种形态，两种都得走通：
+//   A（老，144623 / 075725）：「What's your birthday?」，只有生日、没有姓名框，app 一 mount 就拿默认值
+//      （今天，0 岁）自己发 register-completion —— 140708 实测 confirm-otp 200 后 2.36 s 就出去了，
+//      比我们开始碰下拉早十几秒。成年生日只能改写它自己那一发的请求体，我们再点 Confirm 就是重复提交。
+//   B（新，151827）：「Finish creating your account」，First/Last name 是 required，等满 60 秒
+//      register-completion 一次都没发出来，必须我们填名字、选生日、点 Confirm 它才走。
+// 判据用「改写钩子有没有被触发」，不靠猜屏幕长相：A 一定触发，B 永远不触发。
+const birthdaySubmitState = { completionSeen: false };
+
 async function holdAdultBirthday(page, birthday) {
     const iso = `${birthday.year}-${String(birthday.month).padStart(2, '0')}-${String(birthday.day).padStart(2, '0')}`;
     await page.route('**/api/auth/native/register-completion', async (route) => {
+        birthdaySubmitState.completionSeen = true;
         const raw = route.request().postData() || '';
         // 只就地换 date_of_birth 的那 10 个字符：整包 parse/stringify 会改字节长度，
         // 而浏览器带上去的 Content-Length 不一定跟着改，服务端会读到截断或多余的 JSON。
         const next = raw.replace(/("date_of_birth":")[^"]{10}(")/, `$1${iso}$2`);
         if (next === raw) {
-            console.log('[Muse] register-completion 请求体里没有 date_of_birth，原样放行。');
+            // 也可能是 UI 已经选对了成年日期，替下来是个等价串——别把这行读成「改写失败」。
+            console.log('[Muse] register-completion 没带可替换的 date_of_birth（或已是目标日期），原样放行。');
             await route.continue().catch(() => {});
             return;
         }
@@ -978,6 +986,95 @@ async function holdAdultBirthday(page, birthday) {
         await route.continue({ postData: next }).catch(() => {});
     });
     console.log(`[Muse] 已挂上 register-completion 生日改写，目标日期=${iso}`);
+}
+
+// A 屏自己会动、B 屏不会，所以先等一小会儿分辨是哪一种，再决定碰不碰 UI。
+// Confirm 只在生日屏确实挂着的时候点：老号登录（025224）验证码一过直接落卡页，
+// 而卡页上也有一个 button "Confirm"，认错屏等于拿空卡号去点提交。
+async function driveBirthdayScreen(page, birthday) {
+    const isShown = (locator) => locator.isVisible().catch(() => false);
+    const first = page.locator('input[placeholder="First name"], input[aria-label="First name"]').first();
+    const last = page.locator('input[placeholder="Last name"], input[aria-label="Last name"]').first();
+    const monthSelect = page.locator('select[autocomplete="bday-month"]').first();
+    // 认屏只认生日屏自己的东西：姓名框或 bday 下拉。Confirm 不能当特征，卡页上也有一个。
+    const onBirthdayScreen = async () => (await isShown(first)) || (await monthSelect.count().catch(() => 0)) > 0;
+
+    if (!(await onBirthdayScreen())) {
+        console.log('[Muse] 这一拍没有生日屏：要么老屏已经自己提交换屏了，要么老号登录直接落披露屏/卡页，跳过。');
+        return false;
+    }
+
+    // A 屏在 2.4 s 内就提交完了，导 06 那几秒多半已经发出去；给它留满 8 秒再动手。
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+        if (birthdaySubmitState.completionSeen) {
+            console.log('[Muse] 生日屏自己提交了（register-completion 已改写），不再点 Confirm。');
+            return false;
+        }
+        if (!(await onBirthdayScreen())) {
+            console.log('[Muse] 生日屏在等它自己提交的这几秒里已经换屏，不碰 Confirm。');
+            return false;
+        }
+        await humanPause(page, 400, 900);
+    }
+
+    console.log('[Muse] 8 秒内 register-completion 没自己发出，按「等人点 Confirm」这一屏处理。');
+    try {
+        if (await isShown(first)) {
+            const [givenName, ...familyParts] = String(generateRandomName()).split(' ');
+            console.log(`[Muse] 生日屏填账户信息 ${givenName} ${familyParts.join(' ')}（随机姓名）`);
+            await typeInto(page, first, givenName);
+            if (await isShown(last)) {
+                await typeInto(page, last, familyParts.join(' '));
+            } else {
+                console.log('[Muse] 没看到 Last name 框，只填了名。');
+            }
+        } else {
+            console.log('[Muse] 这屏没有姓名框，只处理生日。');
+        }
+    } catch (error) {
+        // 打字打到一半页面自己提交了（老屏就是这么换屏的），keyboard.type 会直接 reject。
+        // 这里咽掉，继续往下选生日、点 Confirm：真换屏了后面几步各自会跳过，
+        // 冒到 run() 的外层 catch 会把绑卡那步整个跳过，卡页明明已经挂上来了。
+        console.log(`[Muse] 填姓名时页面动了，接着往下走: ${error.message}`);
+    }
+
+    for (const [key, value] of [['month', birthday.month], ['day', birthday.day], ['year', birthday.year]]) {
+        const select = page.locator(`select[autocomplete="bday-${key}"]`).first();
+        if (!(await select.count().catch(() => 0))) continue;
+        // 只改 DOM 的 value，React 的 value tracker 会认为值没变、onChange 不跑，
+        // 提交时拿到的还是 state 里的默认值。用原生 setter 绕过它自己的描述符再派发事件。
+        const changed = await select.evaluate((el, next) => {
+            const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
+            setter.call(el, next);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return String(el.value || '');
+        }, String(value)).catch((error) => {
+            console.log(`[Muse] 选 ${key}=${value} 失败: ${error.message}`);
+            return '';
+        });
+        if (changed !== String(value)) console.log(`[Muse] 选 ${key}=${value} 回读=${changed || '<空>'}，继续。`);
+        await humanPause(page, 200, 600);
+    }
+
+    if (birthdaySubmitState.completionSeen) {
+        // 选完下拉它自己就发出去了（老屏的 mount 提交也可能是 React onChange 带的），再点一次就是重复提交。
+        console.log('[Muse] 填完这屏 register-completion 已经自己发出，不再点 Confirm。');
+        return false;
+    }
+    const confirm = page.locator('button', { hasText: /^Confirm$/ }).first();
+    if (!(await confirm.isVisible().catch(() => false))) {
+        console.log('[Muse] 生日屏没找到 Confirm 按钮。');
+        return false;
+    }
+    await humanPause(page, 600, 1600);
+    const clicked = await humanClick(page, confirm);
+    console.log(clicked ? '[Muse] 已点生日屏 Confirm。' : '[Muse] 生日屏 Confirm 没点到。');
+    // 返回值是「我碰过这一屏」，不是「点成功了」：humanClick 在点下去之后页面立刻跳转时
+    // 也会返回 false（验证码那步同款，见 fillOtpAndSubmit），而这一屏的 URL 前后都是
+    // https://muse.ai/，调用方靠这个值决定导不导 07 —— 提交真成功那一拍最需要现场。
+    return true;
 }
 
 // /access/verification「Confirm your age」只要 4 个字段，而且全在主文档里（153916 的 08 html 实测，
@@ -1398,13 +1495,15 @@ async function run() {
                                     markProgress(94);
                                     await dumpExtraPages(context, page, '06-after-otp-page');
 
-                                    // 成年生日是靠 holdAdultBirthday 改写请求体带过去的，UI 上那个屏我们已经
-                                    // 赶不上了（它在 confirm-otp 后 2.4s 就自己提交了），这里只导出现场。
-                                    // 老号登录压根没有生日屏（025224 直接落卡页），URL 没变就别再导一份一模一样的。
+                                    // 成年生日靠 holdAdultBirthday 改写请求体带过去；生日屏自己会不会提交
+                                    // 由 driveBirthdayScreen 分辨，不会自己提交的它就替我们点 Confirm。
                                     const afterOtpUrl = page.url();
+                                    const birthdayDriven = await driveBirthdayScreen(page, birthday);
                                     await settleAfterAction(page);
                                     markProgress(98);
-                                    if (page.url() !== afterOtpUrl) {
+                                    // URL 在 SPA 里不会变（06 和 08 都是 https://muse.ai/），
+                                    // 碰过这一屏就无条件导一份，否则这一拍现场全无。
+                                    if (birthdayDriven || page.url() !== afterOtpUrl) {
                                         await dumpPage(page, '07-after-birthday');
                                         await dumpExtraPages(context, page, '07-after-birthday-page');
                                     }
