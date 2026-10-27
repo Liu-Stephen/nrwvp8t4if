@@ -1,10 +1,14 @@
 'use strict';
 
 /**
- * muse.ai 注册链路侦察脚本（第一版）
+ * muse.ai 注册链路脚本
  *
- * 只做：打开站点 → dump 首页结构 → 尝试点击注册/登录入口 → dump 后续页面结构。
- * 不填邮箱、不提交验证码、不写数据库。
+ * 流程：打开站点 → 填邮箱/手机号 → 等后台人工下发验证码 → 改写 app 自己发出的 register-completion
+ * 请求体带上成年生日 → 过 disclosure → 在 /access/verification 用卡池里的真卡确认年龄（$1 押金，5-7 工作日退）。
+ * 每一步都导出 json / png / html 到 debug_screenshots/muse-debug/<时间戳>/。
+ *
+ * 会写数据库：reserveCard / releaseCard 走现有卡池的行锁，邮编走现有免税地址池（选地址会改写 last_used_address_id）。
+ * 卡的使用计数暂时不记 —— 扣款成功长什么样还没取证，误记会让共用这批卡的支付流程白白冷却一张卡。
  *
  * 用法：
  *   node muse-register.js
@@ -24,6 +28,9 @@ const path = require('path');
 const readline = require('readline');
 const { connectStandaloneBrowser } = require('./browser-standalone');
 const { preparePlaywrightProxy } = require('./playwright-proxy');
+const store = require('./mysql-store');
+const { pickBillingAddressForCheckout } = require('./tax-free-address');
+const { normalizeCardNumber, normalizeCardExpiry } = require('./stripe-payment');
 
 function stamp() {
     const d = new Date();
@@ -55,6 +62,8 @@ const CONFIG = {
 
 const RUN_DIR = path.join(CONFIG.debugRoot, stamp());
 const VIDEO_TAG = String(process.env.MUSE_JOB_KEY || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) || stamp();
+// 卡池的预留人：跑挂了也能从 locked_by 认出是哪一轮占着卡。
+const CARD_OWNER = `muse_${VIDEO_TAG}`.slice(0, 64);
 
 function markProgress(value) {
     console.log(`MUSE_PROGRESS: ${value}`);
@@ -140,8 +149,11 @@ async function typeInto(page, locator, text, minDelay = 60, maxDelay = 180) {
         }
     }
     const typed = await locator.evaluate((el) => String(el.value || '')).catch(() => '');
-    if (typed.length !== chars.length) {
-        console.log(`[Muse] 逐字符输入后只剩 ${typed.length}/${chars.length} 位，改用 fill`);
+    // 卡号框会自己每 4 位插一个空格（cc-number 的 maxlength=19 就是这么来的），
+    // 按原样比长度会把每张 16 位卡都判成「没落上」，再用 fill 把明文重写一遍。
+    const typedLen = typed.replace(/\s+/g, '').length;
+    if (typedLen !== chars.length) {
+        console.log(`[Muse] 逐字符输入后只剩 ${typedLen}/${chars.length} 位，改用 fill`);
         await locator.fill(String(text), { timeout: 10000 }).catch((error) => {
             console.error(`[Muse] fill 兜底失败: ${error.message}`);
         });
@@ -523,24 +535,6 @@ function tagOtpFields() {
     return info;
 }
 
-// 在页面上下文中执行：读生日屏的三个隐藏 select（可见的是自定义按钮，别点）的当前值和选项数。
-function readBirthdayFields() {
-    const pick = (name) => Array.from(document.querySelectorAll('select'))
-        .find((el) => String(el.autocomplete || '').toLowerCase() === name) || null;
-
-    const month = pick('bday-month');
-    const day = pick('bday-day');
-    const year = pick('bday-year');
-    if (!month || !day || !year) return null;
-
-    return {
-        monthOptions: month.options ? month.options.length : 0,
-        dayOptions: day.options ? day.options.length : 0,
-        yearOptions: year.options ? year.options.length : 0,
-        current: `${month.value}/${day.value}/${year.value}`
-    };
-}
-
 async function collectPageSummary(page) {
     const frames = [];
     const pageFrames = page.frames();
@@ -662,8 +656,19 @@ function printPageSummary(label, summary) {
 
 async function dumpPage(page, label) {
     const base = path.join(RUN_DIR, label);
-    let summary;
 
+    // 先截图、后读 DOM：截图本身要一两秒，SPA 恰好拿这一拍把节点挂完。
+    // 反过来就会导出「JSON 空壳、PNG 整页」的现场（153916 的 08）。
+    try {
+        await page.screenshot({ path: `${base}.png`, fullPage: true, timeout: 30000 });
+    } catch (_) {
+        await page.screenshot({ path: `${base}.png`, fullPage: false, timeout: 30000 }).catch(() => {});
+    }
+    if (fs.existsSync(`${base}.png`)) {
+        console.log(`LIVE_SCREENSHOT: ${base}.png`);
+    }
+
+    let summary;
     try {
         summary = await collectPageSummary(page);
     } catch (error) {
@@ -678,15 +683,6 @@ async function dumpPage(page, label) {
     }
 
     fs.writeFileSync(`${base}.json`, JSON.stringify(summary, null, 2), 'utf8');
-
-    try {
-        await page.screenshot({ path: `${base}.png`, fullPage: true, timeout: 30000 });
-    } catch (_) {
-        await page.screenshot({ path: `${base}.png`, fullPage: false, timeout: 30000 }).catch(() => {});
-    }
-    if (fs.existsSync(`${base}.png`)) {
-        console.log(`LIVE_SCREENSHOT: ${base}.png`);
-    }
 
     try {
         fs.writeFileSync(`${base}.html`, await page.content(), 'utf8');
@@ -965,76 +961,81 @@ async function holdAdultBirthday(page, birthday) {
     console.log(`[Muse] 已挂上 register-completion 生日改写，目标日期=${iso}`);
 }
 
-// 把生日选进三个隐藏下拉。提交内容不由这里决定（成年生日靠 holdAdultBirthday 改写请求体带上去），
-// 这里只让画面和 app 自己的 state 对齐，选不上也只影响观感、不影响判读。
-async function fillBirthdayFields(page, birthday) {
-    const pageFrames = page.frames();
-    for (let i = 0; i < pageFrames.length; i += 1) {
-        const frame = pageFrames[i];
-        let info = null;
-        try {
-            info = await frame.evaluate(readBirthdayFields);
-        } catch (_) {
-            continue;
-        }
-        if (!info) continue;
-
-        console.log(`[Muse] 生日屏 frame#${i} 当前=${info.current} 选项数=${info.monthOptions}/${info.dayOptions}/${info.yearOptions}`);
-        const picks = [
-            ['month', String(birthday.month)],
-            ['day', String(birthday.day)],
-            ['year', String(birthday.year)]
-        ];
-        for (const [key, value] of picks) {
-            try {
-                // 按原生 autocomplete 定位：它不会随 React 重渲染消失。
-                // 之前用注入的 data-muse-bday 找元素，选完 month 节点被换掉，day 白等了 30 秒（140708）。
-                const select = frame.locator(`select[autocomplete="bday-${key}"]`).first();
-                await select.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-                // 只改 DOM 的 value，React 的 value tracker 会认为值没变、onChange 不跑，
-                // 提交时拿到的还是 state 里的默认值。用原生 setter 绕过它自己的描述符再派发事件。
-                const changed = await select.evaluate((el, next) => {
-                    const setter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value').set;
-                    setter.call(el, next);
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                    return String(el.value || '');
-                }, value, { timeout: 5000 });
-                if (changed !== value) {
-                    throw new Error(`回读=${changed || '<空>'}`);
-                }
-                await humanPause(page, 260, 900);
-            } catch (error) {
-                console.error(`[Muse] 选择 ${key}=${value} 失败: ${error.message}`);
-                return;
-            }
-        }
-        const after = await frame.evaluate(() => {
-            const pick = (name) => Array.from(document.querySelectorAll('select'))
-                .find((el) => String(el.autocomplete || '').toLowerCase() === name);
-            // 页面上那三个自定义按钮（October/26/2026）的文案是 state 渲染出来的，
-            // select.value 只能证明 DOM，这一行才能证明 onChange 真的跑进了 state。
-            const display = (el) => {
-                if (!el) return '?';
-                const names = Array.from(el.options).map((o) => String(o.textContent || '').trim());
-                let node = el.parentElement;
-                for (let depth = 0; node && depth < 4; depth += 1) {
-                    const btn = Array.from(node.querySelectorAll('button'))
-                        .find((b) => names.includes(String(b.textContent || '').trim()));
-                    if (btn) return String(btn.textContent || '').trim();
-                    node = node.parentElement;
-                }
-                return '<没找到触发按钮>';
-            };
-            const month = pick('bday-month');
-            const day = pick('bday-day');
-            const year = pick('bday-year');
-            if (!month || !day || !year) return '';
-            return `${month.value}/${day.value}/${year.value} 显示=${display(month)}/${display(day)}/${display(year)}`;
-        }).catch(() => '');
-        console.log(`[Muse] 生日已选 ${birthday.year}-${birthday.month}-${birthday.day}（${birthday.source}）选中后=${after || '<未知>'}`);
-        markProgress(96);
+// /access/verification「Confirm your age」只要 4 个字段，而且全在主文档里（153916 的 08 html 实测，
+// 没有 Stripe iframe）：cc-number / cc-exp / cc-csc / postal-code，国家下拉默认就是 United States。
+// 这页写明会真扣 $1.00（5-7 个工作日退），所以卡走现有卡池的行锁预留、邮编走现有免税地址池。
+async function fillCardAndConfirm(page, context) {
+    // 四个框都在才动手：typeInto 点不上目标时会退回纯键盘，那一串字符就敲进上一个还持焦点的框里。
+    const fields = {
+        number: page.locator('input[autocomplete="cc-number"]').first(),
+        expiry: page.locator('input[autocomplete="cc-exp"]').first(),
+        cvc: page.locator('input[autocomplete="cc-csc"]').first(),
+        postal: page.locator('input[autocomplete="postal-code"]').first()
+    };
+    const missing = [];
+    for (const [key, locator] of Object.entries(fields)) {
+        if (!(await locator.count())) missing.push(key);
+    }
+    if (missing.length) {
+        console.log(`[Muse] 这一屏缺 ${missing.join('/')} 输入框，跳过绑卡。`);
         return;
+    }
+
+    let card = null;
+    try {
+        card = await store.reserveCard(CARD_OWNER);
+        if (!card) {
+            console.log('[Muse] 卡池没有可用卡（占用中/冷却/已报废），跳过绑卡。');
+            return;
+        }
+        // 选地址会顺手改写共享键 last_used_address_id（tax-free-address.js:349），
+        // 那是代充支付用来「别连着重复同一地址」的提示，所以点一次调试注册会影响那边的选取。
+        const lastUsedRaw = await store.getAppConfigValue('last_used_address_id', null);
+        const address = await pickBillingAddressForCheckout(lastUsedRaw ? Number(lastUsedRaw) : null);
+        const number = normalizeCardNumber(card.card_number);
+        const expiry = normalizeCardExpiry(card.card_expiry);
+        const last4 = number.slice(-4);
+        console.log(`[Muse] 已预留卡 ...${last4}（第 ${card.usage_count + 1} 次使用）邮编=${address.postal_code}（${address.generated ? '随机生成' : `地址池 #${address.id}`}）`);
+
+        await typeInto(page, fields.number, number);
+        await typeInto(page, fields.expiry, expiry);
+        await typeInto(page, fields.cvc, String(card.card_cvc || ''));
+        await typeInto(page, fields.postal, String(address.postal_code || ''));
+
+        // 只回读掩码后的结果：卡号末四位、CVV 位数、有效期是否落上，明文不进日志也不进导出包。
+        const readBack = await page.evaluate(() => {
+            const val = (name) => {
+                const el = document.querySelector(`input[autocomplete="${name}"]`);
+                return el ? String(el.value || '') : '';
+            };
+            return { number: val('cc-number'), expiry: val('cc-exp'), cvc: val('cc-csc'), postal: val('postal-code') };
+        }).catch(() => null);
+        console.log(readBack
+            ? `[Muse] 卡页回读 卡号=...${readBack.number.replace(/\D/g, '').slice(-4)} 有效期=${readBack.expiry ? '<已填>' : '<空>'} CVV=${readBack.cvc ? `${readBack.cvc.length} 位` : '<空>'} 邮编=${readBack.postal || '<空>'}`
+            : '[Muse] 卡页回读失败（页面可能已跳转）');
+
+        const confirm = page.locator('button', { hasText: 'Confirm' }).first();
+        if (!(await confirm.count())) {
+            console.log('[Muse] 没找到 Confirm 按钮，保留现场不提交。');
+            return;
+        }
+        await humanPause(page, 900, 2200);
+        if (!await humanClick(page, confirm)) {
+            console.log('[Muse] Confirm 没点到，保留现场。');
+        }
+        await settleAfterAction(page);
+        await dumpPage(page, '09-after-card-confirm');
+        await dumpExtraPages(context, page, '09-after-card-confirm-page');
+
+        // 「卡号框不见了」不能当扣款成功的判据：Confirm 点歪、或拒付后 SPA 跳走，框同样不在。
+        // recordCardUsage 把日使用数顶到 3 次就冷却 24 小时（mysql-store.js:3127），冷却掉的是
+        // 代充支付在抢的同一批卡 —— 漏记只影响取卡顺序，误记要赔一天，所以这里先只报现场、不记账。
+        console.log(`[Muse] 卡页提交后 url=${sanitizeUrl(page.url())} 卡号框还在=${await fields.number.count() ? 'yes' : 'no'}（...${last4} 本轮不记使用，等看过 09 的文案定判据）`);
+    } catch (error) {
+        console.error(`[Muse] 绑卡这步失败: ${error.message}`);
+    } finally {
+        // 卡池的 in_use 是行锁，不管这一步成没成都要放回去。
+        if (card) await store.releaseCard(card.id).catch((error) => console.error(`[Muse] 释放卡片失败: ${error.message}`));
     }
 }
 
@@ -1343,24 +1344,27 @@ async function run() {
                                     markProgress(94);
                                     await dumpExtraPages(context, page, '06-after-otp-page');
 
-                                    // 生日是否真带上去了只看那条「改写 register-completion」日志和它的响应码，
-                                    // 下拉选没选上只影响画面，所以这里不拦 dump。
-                                    await fillBirthdayFields(page, birthday);
+                                    // 成年生日是靠 holdAdultBirthday 改写请求体带过去的，UI 上那个屏我们已经
+                                    // 赶不上了（它在 confirm-otp 后 2.4s 就自己提交了），这里只导出现场。
                                     await settleAfterAction(page);
                                     await dumpPage(page, '07-after-birthday');
                                     markProgress(98);
                                     await dumpExtraPages(context, page, '07-after-birthday-page');
 
-                                    // 生日过了以后这屏已经是 muse.ai/access/disclosure（无输入框，只有 Get started）。
-                                    // 点下去才知道 144623 里那个 POST /api/auth/check 403 是不是真挡住下一步。
+                                    // disclosure 页只有 Get started（点了就是 POST /api/hatch/accept-tos → /access/verification）。
                                     const getStarted = page.locator('button', { hasText: 'Get started' }).first();
                                     if (await getStarted.count()) {
                                         if (!await humanClick(page, getStarted)) {
                                             console.log('[Muse] Get started 没点到，照样导出现场。');
                                         }
-                                        await settleAfterAction(page);
+                                        // 结账屏是客户端异步挂起来的，不等一下就等着导出「加载中」那一帧。
+                                        // 四个框齐不齐由 fillCardAndConfirm 自己判，这里只管现场。
+                                        await page.waitForSelector('input[autocomplete="cc-number"]', { timeout: 20000 }).catch(() => {
+                                            console.log('[Muse] 20s 内没等到卡号输入框，照样导出现场。');
+                                        });
                                         await dumpPage(page, '08-after-disclosure');
                                         await dumpExtraPages(context, page, '08-after-disclosure-page');
+                                        await fillCardAndConfirm(page, context);
                                     } else {
                                         console.log('[Muse] 没有 Get started 按钮，侦察到此为止。');
                                     }
