@@ -4,7 +4,8 @@
  * muse.ai 注册链路脚本
  *
  * 流程：打开站点 → 填邮箱/手机号 → 等后台人工下发验证码 → 改写 app 自己发出的 register-completion
- * 请求体带上成年生日 → 过 disclosure → 在 /access/verification 用卡池里的真卡确认年龄（$1 押金，5-7 工作日退）。
+ * 请求体带上成年生日 → 新号过 disclosure 点 Get started、老号登录后直接落卡页 → 在
+ * /access/verification 用卡池里的真卡确认年龄（$1 押金，5-7 工作日退）。
  * 每一步都导出 json / png / html 到 debug_screenshots/muse-debug/<时间戳>/。
  *
  * 会写数据库：reserveCard / releaseCard 走现有卡池的行锁，邮编走现有免税地址池（选地址会改写 last_used_address_id）。
@@ -923,6 +924,13 @@ async function fillOtpAndSubmit(page, code) {
             if (await submit.count()) {
                 await humanPause(page, 500, 1500);
                 if (!await humanClick(page, submit)) {
+                    // 点不上多半是六位一落页面自己提交并跳走了（025224 就是这样导航到 /access/verification 的），
+                    // 这时候再对着已经失效的旧 locator 按回车，只会在卡页上白等 30 秒的超时。
+                    // frame 被导航销毁时 count 会直接报错，报错也照样当「第二屏不在了」。
+                    if ((await input.count().catch(() => 0)) === 0) {
+                        console.log('[Muse] 确认没点到，但第二屏已经换掉，按已自动提交处理');
+                        return true;
+                    }
                     console.log('[Muse] 确认按钮没点到，改用回车提交');
                     await input.press('Enter').catch(() => {});
                 }
@@ -1346,28 +1354,34 @@ async function run() {
 
                                     // 成年生日是靠 holdAdultBirthday 改写请求体带过去的，UI 上那个屏我们已经
                                     // 赶不上了（它在 confirm-otp 后 2.4s 就自己提交了），这里只导出现场。
+                                    // 老号登录压根没有生日屏（025224 直接落卡页），URL 没变就别再导一份一模一样的。
+                                    const afterOtpUrl = page.url();
                                     await settleAfterAction(page);
-                                    await dumpPage(page, '07-after-birthday');
                                     markProgress(98);
-                                    await dumpExtraPages(context, page, '07-after-birthday-page');
+                                    if (page.url() !== afterOtpUrl) {
+                                        await dumpPage(page, '07-after-birthday');
+                                        await dumpExtraPages(context, page, '07-after-birthday-page');
+                                    }
 
-                                    // disclosure 页只有 Get started（点了就是 POST /api/hatch/accept-tos → /access/verification）。
+                                    // 这一屏有两种落点：新号停在 disclosure（只有 Get started 可点），
+                                    // 老号登录直接落 /access/verification 的卡页（025224 就是）。
+                                    // 所以「没有 Get started」不是终点，认出卡页才是要紧的。
                                     const getStarted = page.locator('button', { hasText: 'Get started' }).first();
                                     if (await getStarted.count()) {
                                         if (!await humanClick(page, getStarted)) {
-                                            console.log('[Muse] Get started 没点到，照样导出现场。');
+                                            console.log('[Muse] Get started 没点到，照样往下找卡页。');
                                         }
-                                        // 结账屏是客户端异步挂起来的，不等一下就等着导出「加载中」那一帧。
-                                        // 四个框齐不齐由 fillCardAndConfirm 自己判，这里只管现场。
-                                        await page.waitForSelector('input[autocomplete="cc-number"]', { timeout: 20000 }).catch(() => {
-                                            console.log('[Muse] 20s 内没等到卡号输入框，照样导出现场。');
-                                        });
-                                        await dumpPage(page, '08-after-disclosure');
-                                        await dumpExtraPages(context, page, '08-after-disclosure-page');
-                                        await fillCardAndConfirm(page, context);
                                     } else {
-                                        console.log('[Muse] 没有 Get started 按钮，侦察到此为止。');
+                                        console.log('[Muse] 这一屏没有 Get started，按已经过了 disclosure 处理。');
                                     }
+                                    // 结账屏是客户端异步挂起来的，不等一下就等着导出「加载中」那一帧。
+                                    // 四个框齐不齐由 fillCardAndConfirm 自己判，这里只管现场。
+                                    await page.waitForSelector('input[autocomplete="cc-number"]', { timeout: 20000 }).catch(() => {
+                                        console.log('[Muse] 20s 内没等到卡号输入框，照样导出现场。');
+                                    });
+                                    await dumpPage(page, '08-card-page');
+                                    await dumpExtraPages(context, page, '08-card-page');
+                                    await fillCardAndConfirm(page, context);
                                 }
                             }
                         }
