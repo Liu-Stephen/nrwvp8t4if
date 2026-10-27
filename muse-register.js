@@ -8,8 +8,10 @@
  * /access/verification 用卡池里的真卡确认年龄（$1 押金，5-7 工作日退）。
  * 每一步都导出 json / png / html 到 debug_screenshots/muse-debug/<时间戳>/。
  *
- * 会写数据库：reserveCard / releaseCard 走现有卡池的行锁，邮编走现有免税地址池（选地址会改写 last_used_address_id）。
- * 卡的使用计数暂时不记 —— 扣款成功长什么样还没取证，误记会让共用这批卡的支付流程白白冷却一张卡。
+ * 会写数据库：reserveCard / recordCardUsage / markCardExhausted / releaseCard 走现有卡池的行锁，邮编走现有免税地址池（选地址会改写 last_used_address_id）。
+ * 结账判据只看网络响应：POST /api/checkout/finalize 的 2xx 才记一次使用（那才是 $1 真扣了），
+ * checkout/credential|finalize 的 4xx 且响应体里有明确拒付措辞才报废这张卡（isPaymentDeclined，代充那边同一套）；
+ * 读不出拒付措辞、5xx 与「90 秒等不到响应」都只报现场，不记账也不报废。
  *
  * 用法：
  *   node muse-register.js
@@ -32,6 +34,8 @@ const { preparePlaywrightProxy } = require('./playwright-proxy');
 const store = require('./mysql-store');
 const { pickBillingAddressForCheckout } = require('./tax-free-address');
 const { normalizeCardNumber, normalizeCardExpiry } = require('./stripe-payment');
+// 代充那边「只有明确拒付才报废」用的就是这个关键词表，绑卡这边照它对齐，别自己定一套。
+const { isPaymentDeclined } = require('./payment-retry');
 
 function stamp() {
     const d = new Date();
@@ -213,6 +217,13 @@ function maskAccount(value) {
 
 function maskEmails(value) {
     return String(value || '').replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, (match) => maskAccount(match));
+}
+
+// 拒付响应体要的是 code/decline_code 这类字符串，长数字串只会是卡号回显，读日志之前先挡掉。
+function maskCardEchoes(value) {
+    return String(value || '')
+        .replace(/\d{4}[ -]\d{4}[ -]\d{4}[ -]\d{1,7}/g, '<卡号>')
+        .replace(/\d{12,19}/g, '<长数字>');
 }
 
 // 生日留空时随机取 22~32 岁；日只到 28，避免造出非法日期。
@@ -973,7 +984,8 @@ async function holdAdultBirthday(page, birthday) {
 // 没有 Stripe iframe）：cc-number / cc-exp / cc-csc / postal-code，国家下拉默认就是 United States。
 // 这页写明会真扣 $1.00（5-7 个工作日退），所以卡走现有卡池的行锁预留、邮编走现有免税地址池。
 async function fillCardAndConfirm(page, context) {
-    // 四个框都在才动手：typeInto 点不上目标时会退回纯键盘，那一串字符就敲进上一个还持焦点的框里。
+    // 四个框都看得见才动手：typeInto 点不上目标时会退回纯键盘，那一串字符就敲进上一个还持焦点的框里。
+    // 用可见而不是节点在不在，和上面那步判「到没到卡页」用同一个口径（isVisible），两边不会各说一套。
     const fields = {
         number: page.locator('input[autocomplete="cc-number"]').first(),
         expiry: page.locator('input[autocomplete="cc-exp"]').first(),
@@ -982,7 +994,7 @@ async function fillCardAndConfirm(page, context) {
     };
     const missing = [];
     for (const [key, locator] of Object.entries(fields)) {
-        if (!(await locator.count())) missing.push(key);
+        if (!(await locator.isVisible().catch(() => false))) missing.push(key);
     }
     if (missing.length) {
         console.log(`[Muse] 这一屏缺 ${missing.join('/')} 输入框，跳过绑卡。`);
@@ -1027,18 +1039,50 @@ async function fillCardAndConfirm(page, context) {
             console.log('[Muse] 没找到 Confirm 按钮，保留现场不提交。');
             return;
         }
+        // 结账那两发都在主文档（031034：checkout/credential 200 → checkout/finalize 200 → 3 秒后离开这页）。
+        // 判据分两种：finalize 的 2xx = $1 真扣了；这两发任意一发回 4xx = 这张卡可能被拒。
+        // 5xx 不算拒卡（那是 Meta 自己的服务问题），所以不放进等待条件，免得白烧一张。
         await humanPause(page, 900, 2200);
+        // 监听器得赶在点下去之前挂好，否则响应会先于等待到达 —— 但停顿不放这儿，那 2 秒也是窗口里的。
+        const isPaid = (response) => /\/api\/checkout\/finalize/i.test(response.url())
+            && response.status() >= 200 && response.status() < 300;
+        const isRejected = (response) => /\/api\/checkout\/(credential|finalize)/i.test(response.url())
+            && response.status() >= 400 && response.status() < 500;
+        // 90 s：031034 从挂监听到 finalize 只花 18 s，但同一轮 humanClick 撞过一次 15 s 超时，
+        // 而它最坏要吃 scrollIntoView 5 s + 停顿 2.4 s + click 15 s + settle 3 s ≈ 25 s，全算在 Meta 之前。
+        // 后台的无输出超时是 3 分钟（server.js:30），90 s 不会把子进程杀掉。
+        const checkout = page.waitForResponse((response) => isPaid(response) || isRejected(response), { timeout: 90000 })
+            .catch(() => null);
         if (!await humanClick(page, confirm)) {
             console.log('[Muse] Confirm 没点到，保留现场。');
         }
         await settleAfterAction(page);
+        const outcome = await checkout;
         await dumpPage(page, '09-after-card-confirm');
         await dumpExtraPages(context, page, '09-after-card-confirm-page');
 
-        // 「卡号框不见了」不能当扣款成功的判据：Confirm 点歪、或拒付后 SPA 跳走，框同样不在。
-        // recordCardUsage 把日使用数顶到 3 次就冷却 24 小时（mysql-store.js:3127），冷却掉的是
-        // 代充支付在抢的同一批卡 —— 漏记只影响取卡顺序，误记要赔一天，所以这里先只报现场、不记账。
-        console.log(`[Muse] 卡页提交后 url=${sanitizeUrl(page.url())} 卡号框还在=${await fields.number.count() ? 'yes' : 'no'}（...${last4} 本轮不记使用，等看过 09 的文案定判据）`);
+        console.log(`[Muse] 卡页提交后 url=${sanitizeUrl(page.url())} 卡号框还在=${await fields.number.count().catch(() => 0) ? 'yes' : 'no'}`);
+        if (!outcome) {
+            console.log(`[Muse] 90s 内没等到 checkout/credential|finalize 的 4xx，也没有 finalize 的 2xx，...${last4} 本轮不记账（原因看 09-after-card-confirm）`);
+        } else if (isPaid(outcome)) {
+            // 只有这一条路径记使用：点歪、字段校验没过都没花钱；finalize 都 2xx 了还不记，就是让下一轮拿同一张卡再刷 $1。
+            const usage = await store.recordCardUsage(card.id);
+            console.log(`[Muse] checkout/finalize ${outcome.status()} → ...${last4} 记一次使用（日累计 ${usage.dailyUsageCount}${usage.cooledDown ? '，已触发 24 小时冷却' : ''}）`);
+        } else {
+            // 4xx 不一定是卡的错：ZIP 取自免税地址池、池空时还随机生成（tax-free-address.js:266），
+            // 那不是这张卡的真实账单地址，Meta 若校验 AVS 就会回 4xx。而报废撤不回来 ——
+            // 后台只有 GET/import/DELETE（server.js:2904），重新导入还会被查重跳过（mysql-store.js:3225）。
+            // 所以沿用代充那边的规矩：响应体里有明确拒付措辞才报废（payment-retry.js:203）。
+            const step = sanitizeUrl(outcome.url()).replace(/^https?:\/\//, '');
+            const detail = maskCardEchoes(maskEmails(await outcome.text().catch(() => '')));
+            const reason = truncate(detail, 300) || '响应体为空';
+            if (isPaymentDeclined(detail)) {
+                await store.markCardExhausted(card.id).catch((error) => console.error(`[Muse] 报废卡片失败: ${error.message}`));
+                console.log(`[Muse] ${step} ${outcome.status()} → ...${last4} 已报废（拒因: ${reason}）`);
+            } else {
+                console.log(`[Muse] ${step} ${outcome.status()} → ...${last4} 保留，响应体里没有拒付措辞（原因: ${reason}）`);
+            }
+        }
     } catch (error) {
         console.error(`[Muse] 绑卡这步失败: ${error.message}`);
     } finally {
@@ -1111,8 +1155,9 @@ function attachNetworkLog(context) {
                 status: response.status(),
                 url: sanitizeUrl(rawUrl)
             });
-            // 注册链路上的报错全靠这个，否则 403 只能看到状态码。
-            if (response.status() >= 400 && /\/api\/auth\/native\//i.test(rawUrl)) {
+            // 注册链路上的报错全靠这个，否则 403 只能看到状态码；结账那两发的 4xx 就是拒卡原因。
+            const isCheckout = /\/api\/checkout\//i.test(rawUrl);
+            if (response.status() >= 400 && (/\/api\/auth\/native\//i.test(rawUrl) || isCheckout)) {
                 response.text().then((body) => {
                     write({
                         at: new Date().toISOString(),
@@ -1120,7 +1165,8 @@ function attachNetworkLog(context) {
                         type,
                         status: response.status(),
                         url: sanitizeUrl(rawUrl),
-                        body: truncate(body, 2000)
+                        // 结账响应体可能回显卡号，写进导出产物前先打码。
+                        body: truncate(isCheckout ? maskCardEchoes(body) : body, 2000)
                     });
                 }).catch(() => {});
             }
